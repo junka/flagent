@@ -12,7 +12,7 @@ export interface LLMConfig {
 }
 
 let API_KEY = process.env.DASHSCOPE_API_KEY || "";
-let WORKSPACE_ID = process.env.WORKSPACE_ID || "llm-v7cepeucys535ynp";
+let WORKSPACE_ID = process.env.WORKSPACE_ID || "";
 let MODEL_NAME = process.env.MODEL_NAME || "qwen3.8-max";
 
 function computeBaseUrl(workspaceId: string): string {

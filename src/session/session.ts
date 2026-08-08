@@ -9,6 +9,18 @@ import type { MainAgent, AgentResult, AgentStep } from "../agents/main-agent";
 import type { Scheduler } from "../agents/scheduler";
 import type { ContextManager } from "../context/context-manager";
 import type { SessionData } from "./session-data";
+import type {
+  AgentEvent,
+  ConfirmPlanFn,
+} from "../agents/agent-events";
+
+/** 运行选项：流式事件回调与 Plan 门控确认回调，全部可选（旧调用零改动）。 */
+export interface RunOptions {
+  /** 实时事件回调（思考/Plan/工具执行/最终答案等）。 */
+  onEvent?: (event: AgentEvent) => void;
+  /** 多步骤 Plan 执行前的确认回调；返回 false 取消。 */
+  confirmPlan?: ConfirmPlanFn;
+}
 
 export interface SessionCreateInit {
   id: string;
@@ -102,14 +114,40 @@ export class Session {
     });
   }
 
-  /** 执行任务：首次自动派生 title，累积 steps，更新 updatedAt。 */
-  async run(task: string): Promise<AgentResult> {
+  /** 执行任务：首次自动派生 title，累积 steps，更新 updatedAt。可选流式事件与 Plan 门控。 */
+  async run(task: string, options?: RunOptions): Promise<AgentResult> {
     if (!this.title) this.title = this.deriveTitle(task);
-    const result = await this.mainAgent.run(task);
-    // MainAgent.run 每次重置自身 steps；Session 是跨 run 历史真相源，累积保留
-    this.steps = [...this.steps, ...result.steps];
-    this.updatedAt = Date.now();
-    return result;
+
+    // 桥接事件：监听 mainAgent + toolExecutor 的 "event" 通道，转发给 onEvent
+    const onEvent = options?.onEvent;
+    const toolExecutor = this.mainAgent.getToolExecutor();
+    let mainHandler: ((e: AgentEvent) => void) | undefined;
+    let toolHandler: ((e: AgentEvent) => void) | undefined;
+    if (onEvent) {
+      mainHandler = (e: AgentEvent) => onEvent(e);
+      this.mainAgent.on("event", mainHandler);
+      if (toolExecutor) {
+        toolHandler = (e: AgentEvent) => onEvent(e);
+        toolExecutor.on("event", toolHandler);
+      }
+    }
+    // Plan 门控回调注入
+    if (options?.confirmPlan) {
+      this.mainAgent.setConfirmPlanFn(options.confirmPlan);
+    }
+
+    try {
+      const result = await this.mainAgent.run(task);
+      // MainAgent.run 每次重置自身 steps；Session 是跨 run 历史真相源，累积保留
+      this.steps = [...this.steps, ...result.steps];
+      this.updatedAt = Date.now();
+      return result;
+    } finally {
+      // 清理监听，避免跨 run 累积；重置 confirmPlanFn
+      if (mainHandler) this.mainAgent.off("event", mainHandler);
+      if (toolHandler && toolExecutor) toolExecutor.off("event", toolHandler);
+      if (options?.confirmPlan) this.mainAgent.setConfirmPlanFn(undefined);
+    }
   }
 
   /** 序列化为可持久化结构（messages 去 timestamp/tokenCount）。 */

@@ -5,6 +5,7 @@ import { API_KEY, MODEL_NAME, WORKSPACE_ID } from "../llm/client";
 import { createAgentSystem, type AgentSystem } from "../agents/factory";
 import { createToolRegistry } from "../tools/factory";
 import { SessionManager } from "../session/session-manager";
+import type { AgentEvent } from "../agents/agent-events";
 
 // 兼容旧 import 路径（tests 仍从 dist/cli/index 取 createAgentSystem / createToolRegistry）
 export { createAgentSystem, createToolRegistry, type AgentSystem };
@@ -30,6 +31,7 @@ const HELP_TEXT = `
 
 会话内命令:
   /help              显示帮助信息
+  /verbose           切换思考过程显示（默认精简，切换后显示完整思考与工具结果）
   /agents            显示所有子智能体
   /tools             显示所有可用工具
   /context           显示当前上下文状态
@@ -42,6 +44,7 @@ const HELP_TEXT = `
   - 直接输入问题即可与多智能体系统对话
   - 无活动会话时首次提问会自动新建会话
   - 会话自动持久化到 .flagent/sessions/，重启后可 /switch 恢复
+  - 思考过程实时流式输出；多步骤 Plan 会暂停等待确认，单步骤直接执行
 `;
 
 function fmtTime(ts: number): string {
@@ -53,6 +56,20 @@ function fmtTime(ts: number): string {
 /** 标题截短显示。 */
 function shortTitle(t: string): string {
   return t ? (t.length > 24 ? t.slice(0, 24) + "…" : t) : "(未命名)";
+}
+
+/** 文本按指定前缀缩进每一行。 */
+function indent(text: string, prefix: string): string {
+  return text
+    .split("\n")
+    .map((l) => prefix + l)
+    .join("\n");
+}
+
+/** 截断长文本为单行预览。 */
+function preview(text: string, max = 100): string {
+  const oneLine = text.replace(/\n/g, " ").trim();
+  return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
 }
 
 export async function startCLI(): Promise<void> {
@@ -83,6 +100,7 @@ export async function startCLI(): Promise<void> {
   const toolRegistry = createToolRegistry();
   const sessionManager = new SessionManager({ toolRegistry, confirmFn });
   let mainAgentRunning = false; // run 期间拦截新输入（权限确认的 y/n 由 rl.question 处理）
+  let verbose = false; // /verbose 切换：默认精简，开启后显示完整思考与工具结果
 
   /** 更新提示符，含当前会话标题。 */
   const refreshPrompt = (): void => {
@@ -131,6 +149,15 @@ export async function startCLI(): Promise<void> {
 
     if (input === "/help") {
       console.log(HELP_TEXT);
+      rl.prompt();
+      return;
+    }
+
+    if (input === "/verbose") {
+      verbose = !verbose;
+      console.log(
+        `\n🔊 思考过程显示已${verbose ? "开启" : "关闭"}（${verbose ? "完整思考与工具结果" : "精简摘要"}）。\n`
+      );
       rl.prompt();
       return;
     }
@@ -347,30 +374,128 @@ export async function startCLI(): Promise<void> {
     }
 
     // 普通任务：经 SessionManager 执行（无活动会话则自动新建）
+    // 通过 onEvent 流式输出思考/工具执行过程；多步骤 Plan 经 confirmPlan 门控
     console.log("\n🤖 正在思考...");
     mainAgentRunning = true;
-    try {
-      const result = await sessionManager.run(input);
 
-      console.log(`\n✅ 最终回答：`);
-      console.log(`   ${result.finalAnswer}\n`);
+    /** 流式事件渲染：verbose 控制思考/结果详细程度，工具执行实时打印 */
+    const onEvent = (event: AgentEvent): void => {
+      switch (event.type) {
+        case "stepStart":
+          if (verbose)
+            console.log(`\n━━━ Step ${event.step}/${event.maxSteps} ━━━`);
+          break;
 
-      console.log(`📈 执行统计：`);
-      console.log(`   步骤数: ${result.steps.length}`);
-      console.log(`   Token 数: ${result.totalTokens}`);
-      console.log(`   耗时: ${(result.duration / 1000).toFixed(1)}s`);
-      console.log(`   状态: ${result.success ? "✓ 成功" : "✗ 未完成"}\n`);
-
-      if (result.steps.length > 0) {
-        console.log("📝 执行过程：");
-        for (const step of result.steps) {
-          const obs = step.observation
-            ? ` | ${step.observation.slice(0, 120).replace(/\n/g, " ")}`
-            : "";
-          console.log(`   Step ${step.step}: [${step.action}]${obs}`);
+        case "thought": {
+          if (verbose) {
+            console.log(`\n  💭 思考:`);
+            console.log(indent(event.thought, "     "));
+          } else {
+            const head = event.thought.split("\n")[0];
+            console.log(`\n  💭 ${preview(head, 80)}`);
+          }
+          break;
         }
-        console.log();
+
+        case "plan": {
+          const tag = event.isMultiStep ? "（多步骤·待确认）" : "（单步骤·直接执行）";
+          console.log(`\n  📋 Plan${tag}:`);
+          console.log(indent(event.plan, "     "));
+          break;
+        }
+
+        case "planConfirmed":
+          console.log(
+            event.confirmed
+              ? `  ▶️  已确认，开始执行`
+              : `  ⏹️  已取消该计划`
+          );
+          break;
+
+        case "actionStart":
+          console.log(
+            `  🔧 执行工具: ${event.actions
+              .map((a) => a.toolName)
+              .join(", ")}`
+          );
+          break;
+
+        case "toolStart":
+          if (verbose)
+            console.log(
+              `     → 开始 ${event.action.toolName}(${JSON.stringify(
+                event.action.toolArgs
+              )})`
+            );
+          break;
+
+        case "toolEnd": {
+          const r = event.result;
+          const mark = r.success ? "✓" : "✗";
+          const skipped = r.skipped ? "（跳过）" : "";
+          console.log(`     ${mark} ${r.toolName}${skipped}: ${preview(r.result, 100)}`);
+          if (verbose && r.result.length > 100)
+            console.log(indent(r.result, "        "));
+          break;
+        }
+
+        case "actionEnd":
+          // 精简模式下 toolEnd 已实时打印每个工具；verbose 在 toolEnd 已展开结果，此处不重复
+          break;
+
+        case "delegateStart":
+          console.log(`  🤝 委派子智能体: ${event.agents.join(", ")}`);
+          break;
+
+        case "delegateEnd":
+          for (const d of event.results) {
+            const mark = d.success ? "✓" : "✗";
+            console.log(`     ${mark} ${d.agentId}: ${preview(d.result, 100)}`);
+            if (verbose && d.result.length > 100)
+              console.log(indent(d.result, "        "));
+          }
+          break;
+
+        case "spawnAgent": {
+          const mark = event.success ? "✓" : "✗";
+          const detail = event.success
+            ? `role=${event.config.role}, tools=${event.config.toolNames.join(", ")}`
+            : event.message || "注册失败";
+          console.log(`     ${mark} SPAWN ${event.config.id}: ${detail}`);
+          break;
+        }
+
+        case "finalAnswer":
+          console.log(`\n✅ 最终回答：`);
+          console.log(indent(event.answer, "   "));
+          break;
+
+        case "stepEnd":
+          break;
+
+        case "complete": {
+          console.log(`\n📈 执行统计：`);
+          console.log(`   耗时: ${(event.duration / 1000).toFixed(1)}s`);
+          console.log(`   Token 数: ${event.totalTokens}`);
+          console.log(
+            `   状态: ${event.success ? "✓ 成功" : "✗ 未完成"}\n`
+          );
+          break;
+        }
       }
+    };
+
+    /** 多步骤 Plan 门控：rl.question 询问 y/n（mainAgentRunning 期间不会被 line 事件拦截） */
+    const confirmPlan = (_plan: string): Promise<boolean> => {
+      return new Promise((resolve) => {
+        rl.question(`\n  ⏸️  上述 Plan 为多步骤，是否执行? (y/n) `, (answer) => {
+          resolve(answer.trim().toLowerCase().startsWith("y"));
+        });
+      });
+    };
+
+    try {
+      await sessionManager.run(input, { onEvent, confirmPlan });
     } catch (error: any) {
       console.error(`\n❌ 执行出错: ${error.message}\n`);
     } finally {

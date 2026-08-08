@@ -6,7 +6,7 @@ import type { ToolRegistry } from "../tools/registry";
 import type { ConfirmFn } from "../permissions/permission-manager";
 import type { AgentResult } from "../agents/main-agent";
 import { SessionStore } from "./session-store";
-import { Session } from "./session";
+import { Session, type RunOptions } from "./session";
 import type { SessionMeta } from "./session-data";
 
 export interface SessionManagerOptions {
@@ -106,10 +106,10 @@ export class SessionManager {
     return this.store.delete(id);
   }
 
-  /** 执行任务：无活动会话则自动新建；run 后持久化。 */
-  async run(task: string): Promise<AgentResult> {
+  /** 执行任务：无活动会话则自动新建；run 后持久化。可选流式事件与 Plan 门控透传给 Session。 */
+  async run(task: string, options?: RunOptions): Promise<AgentResult> {
     if (!this.current()) await this.create();
-    const result = await this.current()!.run(task);
+    const result = await this.current()!.run(task, options);
     await this.persistActive();
     return result;
   }

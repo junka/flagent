@@ -1,3 +1,4 @@
+import { EventEmitter } from "events";
 import { ContextManager, type Message } from "../context/context-manager";
 import { ToolRegistry } from "../tools/registry";
 import { Scheduler, type DispatchResult } from "./scheduler";
@@ -7,6 +8,7 @@ import {
   type PlannedAction,
 } from "./tool-executor";
 import { parseMainReactResponse } from "./react-parser";
+import type { AgentEvent, ConfirmPlanFn } from "./agent-events";
 import { generateText } from "ai";
 import { model } from "../llm/client";
 
@@ -27,13 +29,14 @@ export interface AgentResult {
   duration: number;
 }
 
-export class MainAgent {
+export class MainAgent extends EventEmitter {
   private contextManager: ContextManager;
   private toolRegistry: ToolRegistry;
   private scheduler: Scheduler;
   private toolExecutor?: ToolExecutor;
   private maxSteps: number;
   private steps: AgentStep[] = [];
+  private confirmPlanFn?: ConfirmPlanFn;
 
   constructor(
     contextManager: ContextManager,
@@ -42,11 +45,22 @@ export class MainAgent {
     toolExecutor?: ToolExecutor,
     maxSteps: number = 20
   ) {
+    super();
     this.contextManager = contextManager;
     this.toolRegistry = toolRegistry;
     this.scheduler = scheduler;
     this.toolExecutor = toolExecutor;
     this.maxSteps = maxSteps;
+  }
+
+  /** 统一事件发射 helper。 */
+  private emitEvent(event: AgentEvent): void {
+    this.emit("event", event);
+  }
+
+  /** 设置 Plan 确认回调（多步骤 Plan 执行前询问用户）。传 undefined 清除。 */
+  setConfirmPlanFn(fn?: ConfirmPlanFn): void {
+    this.confirmPlanFn = fn;
   }
 
   // 公共访问器：消除 CLI 里 (mainAgent as any) 的 hack
@@ -78,7 +92,9 @@ export class MainAgent {
     });
 
     for (let step = 1; step <= this.maxSteps; step++) {
+      this.emitEvent({ type: "stepStart", step, maxSteps: this.maxSteps });
       const stepResult = await this.reactStep(step, userTask);
+      this.emitEvent({ type: "stepEnd", step });
 
       if (stepResult.isComplete) {
         await this.contextManager.addMessage({
@@ -86,33 +102,74 @@ export class MainAgent {
           content: stepResult.answer,
         });
 
-        return {
+        const result: AgentResult = {
           success: true,
           finalAnswer: stepResult.answer,
           steps: this.steps,
           totalTokens: this.contextManager.getTotalTokens(),
           duration: Date.now() - startTime,
         };
+        this.emitEvent({
+          type: "complete",
+          success: true,
+          finalAnswer: stepResult.answer,
+          duration: result.duration,
+          totalTokens: result.totalTokens,
+        });
+        return result;
       }
 
       if (stepResult.needsMoreInfo) {
-        return {
+        const result: AgentResult = {
           success: false,
           finalAnswer: stepResult.answer,
           steps: this.steps,
           totalTokens: this.contextManager.getTotalTokens(),
           duration: Date.now() - startTime,
         };
+        this.emitEvent({
+          type: "complete",
+          success: false,
+          finalAnswer: stepResult.answer,
+          duration: result.duration,
+          totalTokens: result.totalTokens,
+        });
+        return result;
       }
     }
 
-    return {
+    const result: AgentResult = {
       success: false,
       finalAnswer: "已达到最大步数限制，任务未能完成。",
       steps: this.steps,
       totalTokens: this.contextManager.getTotalTokens(),
       duration: Date.now() - startTime,
     };
+    this.emitEvent({
+      type: "complete",
+      success: false,
+      finalAnswer: result.finalAnswer,
+      duration: result.duration,
+      totalTokens: result.totalTokens,
+    });
+    return result;
+  }
+
+  /**
+   * 判断是否为多步骤 Plan（两者结合）：
+   * ① PLAN 文本含 ≥2 个编号步骤（1. / 1) / 1、 等格式，按行匹配）
+   * ② 当前 step 并发动作数（actions + delegates）≥2
+   * 满足任一即视为多步骤，需用户确认。
+   */
+  private isMultiStepPlan(
+    plan: string,
+    actionCount: number,
+    delegateCount: number
+  ): boolean {
+    const numberedStepLines = plan
+      .split("\n")
+      .filter((l) => /^\s*\d+[.\)、]/.test(l)).length;
+    return numberedStepLines >= 2 || actionCount + delegateCount >= 2;
   }
 
   private async reactStep(
@@ -192,7 +249,10 @@ FINAL_ANSWER: [任务完成时的最终答案]
     const { thought, plan, actions, delegates, spawnAgents, finalAnswer } =
       parseMainReactResponse(text);
 
+    if (thought) this.emitEvent({ type: "thought", step, thought });
+
     if (finalAnswer) {
+      this.emitEvent({ type: "finalAnswer", step, answer: finalAnswer });
       this.steps.push({
         step,
         action: "FINAL_ANSWER",
@@ -226,6 +286,36 @@ FINAL_ANSWER: [任务完成时的最终答案]
 
     // 记录 PLAN（若有），写入上下文供后续步骤参考策略
     if (hasPlan) {
+      const isMultiStep = this.isMultiStepPlan(
+        plan,
+        actions.length,
+        delegates.length
+      );
+      this.emitEvent({ type: "plan", step, plan, isMultiStep });
+
+      // 多步骤 Plan 门控：等待用户确认后再执行
+      if (isMultiStep && this.confirmPlanFn) {
+        const confirmed = await this.confirmPlanFn(plan, step);
+        this.emitEvent({ type: "planConfirmed", step, confirmed });
+        if (!confirmed) {
+          this.steps.push({
+            step,
+            action: "PLAN_CANCELLED",
+            thought,
+            observation: "用户取消执行计划",
+            plan,
+          });
+          await this.contextManager.addMessagesBatch([
+            { role: "assistant", content: `[PLAN 取消] ${plan}` },
+          ]);
+          return {
+            isComplete: true,
+            needsMoreInfo: false,
+            answer: "用户已取消该计划。",
+          };
+        }
+      }
+
       this.steps.push({
         step,
         action: "PLAN",
@@ -242,6 +332,12 @@ FINAL_ANSWER: [任务完成时的最终答案]
       for (const sp of spawnAgents) {
         try {
           this.scheduler.registerDynamicAgent(sp);
+          this.emitEvent({
+            type: "spawnAgent",
+            step,
+            config: sp,
+            success: true,
+          });
           this.steps.push({
             step,
             action: `SPAWN_AGENT → ${sp.id}`,
@@ -249,6 +345,13 @@ FINAL_ANSWER: [任务完成时的最终答案]
             observation: `role=${sp.role}, tools=${sp.toolNames.join(", ")}`,
           });
         } catch (err: any) {
+          this.emitEvent({
+            type: "spawnAgent",
+            step,
+            config: sp,
+            success: false,
+            message: err.message,
+          });
           this.steps.push({
             step,
             action: `SPAWN_AGENT → ${sp.id}`,
@@ -262,6 +365,10 @@ FINAL_ANSWER: [任务完成时的最终答案]
         }
       }
     }
+
+    if (hasActions) this.emitEvent({ type: "actionStart", step, actions });
+    if (hasDelegates)
+      this.emitEvent({ type: "delegateStart", step, agents: delegates });
 
     const actionTask: Promise<ActionResult[]> = hasActions
       ? this.toolExecutor
@@ -281,6 +388,15 @@ FINAL_ANSWER: [任务完成时的最终答案]
       actionTask,
       delegateTask,
     ]);
+
+    if (hasActions)
+      this.emitEvent({ type: "actionEnd", step, results: actionResults });
+    if (hasDelegates)
+      this.emitEvent({
+        type: "delegateEnd",
+        step,
+        results: delegateResults,
+      });
 
     for (const r of actionResults) {
       this.steps.push({

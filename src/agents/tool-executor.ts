@@ -3,7 +3,9 @@
 // ② 拒绝的标记 skipped 不执行
 // ③ concurrent:true 的只读采集并发执行；其余串行（保守，避免副作用冲突）
 // ④ 保持原顺序返回
+// 通过 EventEmitter 实时推送 toolStart/toolEnd，供 CLI 流式打印并发执行过程。
 
+import { EventEmitter } from "events";
 import { ToolRegistry } from "../tools/registry";
 import { PermissionManager } from "../permissions/permission-manager";
 
@@ -22,7 +24,7 @@ export interface ActionResult {
 
 type Permit = { ok: boolean; reason: "ok" | "denied" | "not_found" };
 
-export class ToolExecutor {
+export class ToolExecutor extends EventEmitter {
   private concurrencyLimit: number;
 
   constructor(
@@ -30,6 +32,7 @@ export class ToolExecutor {
     private permissionManager?: PermissionManager,
     concurrencyLimit = 8
   ) {
+    super();
     // 并发工具在途上限，避免一次大批只读采集耗尽 FD/连接/内存
     this.concurrencyLimit = Math.max(1, concurrencyLimit);
   }
@@ -106,16 +109,26 @@ export class ToolExecutor {
   }
 
   private async runOne(a: PlannedAction): Promise<ActionResult> {
+    this.emit("event", { type: "toolStart", action: a });
     try {
       const result = await this.toolRegistry.execute(a.toolName, a.toolArgs);
-      return { toolName: a.toolName, toolArgs: a.toolArgs, success: true, result };
+      const r: ActionResult = {
+        toolName: a.toolName,
+        toolArgs: a.toolArgs,
+        success: true,
+        result,
+      };
+      this.emit("event", { type: "toolEnd", result: r });
+      return r;
     } catch (err: any) {
-      return {
+      const r: ActionResult = {
         toolName: a.toolName,
         toolArgs: a.toolArgs,
         success: false,
         result: `[工具执行失败] ${err.message}`,
       };
+      this.emit("event", { type: "toolEnd", result: r });
+      return r;
     }
   }
 
