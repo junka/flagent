@@ -1,0 +1,154 @@
+{
+  "name": "flagent",
+  "displayName": "Flagent Multi-Agent",
+  "description": "基于 Vercel AI SDK 的多智能体协作系统，支持会话管理、代码分析、任务规划、信息检索等",
+  "version": "0.1.0",
+  "publisher": "flagent",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/vscode/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "flagent",
+          "title": "Flagent",
+          "icon": "media/flagent.svg"
+        }
+      ]
+    },
+    "views": {
+      "flagent": [
+        {
+          "id": "flagent.sessions",
+          "name": "会话"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "flagent.session.new",
+        "title": "Flagent: 新建会话",
+        "icon": { "light": "media/new.svg", "dark": "media/new.svg" }
+      },
+      {
+        "command": "flagent.session.switch",
+        "title": "Flagent: 切换会话"
+      },
+      {
+        "command": "flagent.session.delete",
+        "title": "Flagent: 删除会话"
+      },
+      {
+        "command": "flagent.session.rename",
+        "title": "Flagent: 重命名会话"
+      },
+      {
+        "command": "flagent.session.refresh",
+        "title": "Flagent: 刷新会话列表",
+        "icon": { "light": "media/refresh.svg", "dark": "media/refresh.svg" }
+      },
+      {
+        "command": "flagent.chat",
+        "title": "Flagent: 开始对话"
+      },
+      {
+        "command": "flagent.showPanel",
+        "title": "Flagent: 打开对话面板"
+      },
+      {
+        "command": "flagent.analyzeSelection",
+        "title": "Flagent: 分析选中代码"
+      },
+      {
+        "command": "flagent.clearContext",
+        "title": "Flagent: 清除当前会话上下文"
+      },
+      {
+        "command": "flagent.showStatus",
+        "title": "Flagent: 显示状态"
+      },
+      {
+        "command": "flagent.openWebview",
+        "title": "Flagent: 打开 Webview"
+      },
+      {
+        "command": "flagent.reloadLLMConfig",
+        "title": "Flagent: 重新加载 LLM 配置"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "flagent.session.new",
+          "when": "view == flagent.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "flagent.session.refresh",
+          "when": "view == flagent.sessions",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "flagent.session.rename",
+          "when": "view == flagent.sessions && viewItem =~ /session/",
+          "group": "1_modification@1"
+        },
+        {
+          "command": "flagent.session.delete",
+          "when": "view == flagent.sessions && viewItem =~ /session/",
+          "group": "1_modification@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "flagent.session.switch",
+          "when": "false"
+        },
+        {
+          "command": "flagent.analyzeSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Flagent",
+      "properties": {
+        "flagent.apiKey": {
+          "type": "string",
+          "description": "DashScope API Key",
+          "default": ""
+        },
+        "flagent.workspaceId": {
+          "type": "string",
+          "description": "DashScope Workspace ID",
+          "default": "llm-v7cepeucys535ynp"
+        },
+        "flagent.model": {
+          "type": "string",
+          "description": "模型名称",
+          "default": "qwen3.8-max"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . --watch"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "@ai-sdk/openai": "^4.0.34",
+    "ai": "^7.0.56",
+    "zod": "^4.4.3"
+  }
+}

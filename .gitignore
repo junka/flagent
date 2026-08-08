@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+.vscode-test/
+.flagent/
+src/vscode/out/
+src/vscode/node_modules/

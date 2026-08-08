@@ -1,0 +1,345 @@
+import { ContextManager, type Message } from "../context/context-manager";
+import { ToolRegistry } from "../tools/registry";
+import { Scheduler, type DispatchResult } from "./scheduler";
+import {
+  ToolExecutor,
+  type ActionResult,
+  type PlannedAction,
+} from "./tool-executor";
+import { parseMainReactResponse } from "./react-parser";
+import { generateText } from "ai";
+import { model } from "../llm/client";
+
+export interface AgentStep {
+  step: number;
+  action: string;
+  thought: string;
+  observation: string;
+  agentId?: string;
+  plan?: string; // 阶段8：PLAN 步骤记录的总体方案
+}
+
+export interface AgentResult {
+  success: boolean;
+  finalAnswer: string;
+  steps: AgentStep[];
+  totalTokens: number;
+  duration: number;
+}
+
+export class MainAgent {
+  private contextManager: ContextManager;
+  private toolRegistry: ToolRegistry;
+  private scheduler: Scheduler;
+  private toolExecutor?: ToolExecutor;
+  private maxSteps: number;
+  private steps: AgentStep[] = [];
+
+  constructor(
+    contextManager: ContextManager,
+    toolRegistry: ToolRegistry,
+    scheduler: Scheduler,
+    toolExecutor?: ToolExecutor,
+    maxSteps: number = 20
+  ) {
+    this.contextManager = contextManager;
+    this.toolRegistry = toolRegistry;
+    this.scheduler = scheduler;
+    this.toolExecutor = toolExecutor;
+    this.maxSteps = maxSteps;
+  }
+
+  // 公共访问器：消除 CLI 里 (mainAgent as any) 的 hack
+  getScheduler(): Scheduler {
+    return this.scheduler;
+  }
+  getToolRegistry(): ToolRegistry {
+    return this.toolRegistry;
+  }
+  getContextManager(): ContextManager {
+    return this.contextManager;
+  }
+  getToolExecutor(): ToolExecutor | undefined {
+    return this.toolExecutor;
+  }
+
+  /** 恢复历史 steps（会话重载，仅用于显示；下一次 run() 会重置）。 */
+  setSteps(steps: AgentStep[]): void {
+    this.steps = [...steps];
+  }
+
+  async run(userTask: string): Promise<AgentResult> {
+    const startTime = Date.now();
+    this.steps = [];
+
+    await this.contextManager.addMessage({
+      role: "user",
+      content: userTask,
+    });
+
+    for (let step = 1; step <= this.maxSteps; step++) {
+      const stepResult = await this.reactStep(step, userTask);
+
+      if (stepResult.isComplete) {
+        await this.contextManager.addMessage({
+          role: "assistant",
+          content: stepResult.answer,
+        });
+
+        return {
+          success: true,
+          finalAnswer: stepResult.answer,
+          steps: this.steps,
+          totalTokens: this.contextManager.getTotalTokens(),
+          duration: Date.now() - startTime,
+        };
+      }
+
+      if (stepResult.needsMoreInfo) {
+        return {
+          success: false,
+          finalAnswer: stepResult.answer,
+          steps: this.steps,
+          totalTokens: this.contextManager.getTotalTokens(),
+          duration: Date.now() - startTime,
+        };
+      }
+    }
+
+    return {
+      success: false,
+      finalAnswer: "已达到最大步数限制，任务未能完成。",
+      steps: this.steps,
+      totalTokens: this.contextManager.getTotalTokens(),
+      duration: Date.now() - startTime,
+    };
+  }
+
+  private async reactStep(
+    step: number,
+    userTask: string
+  ): Promise<{
+    isComplete: boolean;
+    needsMoreInfo: boolean;
+    answer: string;
+  }> {
+    const messages = this.contextManager.getActiveMessages();
+    const historyText = messages
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n");
+
+    const summary = this.contextManager.getSummary();
+    const summaryText = summary ? `\n\n历史摘要：\n${summary}` : "";
+
+    const toolsDescription = this.toolRegistry
+      .getAll()
+      .map((t) => `- ${t.name}: ${t.description}`)
+      .join("\n");
+
+    const agentsDescription = this.scheduler
+      .getAllAgents()
+      .map(
+        (a) =>
+          `- ${a.id} (${a.name}): 角色=${a.role}, 工具=${a.toolNames.join(", ")}`
+      )
+      .join("\n");
+
+    const prompt = `你是一个多智能体系统的主控制器，拥有全部工具并可直接执行，也可委派子智能体做独立深挖。按 ReAct 模式工作，尽量并发采集信息后统一思考。
+
+工作方法（侦察 → 分类 → 深挖，非强制状态机，按任务复杂度自主决定）：
+1. 侦察：复杂任务第一步优先并发只读采集（多个 concurrent 工具同时跑），先获取事实再判断。不要在未侦察前就凭题目字面猜类别并硬路由到某个 agent。
+2. 分类：基于侦察观察自主归类（落进 web/pwn/reverse/crypto/misc 之一，或判断为新题）。
+3. 深挖：MainAgent 继续用合适工具深入，或并发 DELEGATE 给专家 agent；不落进预设类别的新题可 SPAWN_AGENT 自定义通用 agent 再 DELEGATE。
+简单任务（如算术、常识问答）可跳过 PLAN/ACTIONS 直接 FINAL_ANSWER。
+
+步骤 ${step}/${this.maxSteps}
+
+用户任务：${userTask}
+
+可用工具（可直接调用，鼓励并发只读采集）：
+${toolsDescription}
+
+可用子智能体（适合需独立多步深挖、或输出较大的子任务）：
+${agentsDescription}
+
+对话历史：
+${historyText}
+${summaryText}
+
+输出格式（PLAN 通常仅第一步输出；ACTIONS / SPAWN_AGENT / DELEGATE 可同时出现以并发推进）：
+PLAN: [可选：侦察目标 + 总体方案。简单任务可省略]
+THOUGHT: [思考：分析进展、决定下一步。若 DELEGATE 多个 agent，在此说明每个 agent 的子任务]
+ACTIONS:
+  - <工具名>({...参数JSON...})
+  - <工具名>({...参数JSON...})
+SPAWN_AGENT: {"id":"gen-xxx","name":"...","role":"...","systemPrompt":"...","toolNames":["t1","t2"]}
+DELEGATE: <agentId1>, <agentId2>
+FINAL_ANSWER: [任务完成时的最终答案]
+
+规则：
+- 优先并发只读采集（ACTIONS 多个只读工具同时跑），再统一思考
+- 未侦察前不要凭题目字面猜类别并硬路由到某个 agent；先侦察再分类
+- 仅当子任务需独立多步深挖或输出较大时才 DELEGATE 给已有 agent
+- 仅当任务不落进任一预设 agent 类别、且需要独立深挖时，才 SPAWN_AGENT 自定义通用 agent（id 须唯一、toolNames 必须来自上方可用工具），随后 DELEGATE 给它
+- 工具调用格式必须为 工具名(JSON参数)
+- 任务完成输出 FINAL_ANSWER，简单任务可直接回答`;
+
+    const { text } = await generateText({
+      model,
+      prompt,
+    });
+
+    const { thought, plan, actions, delegates, spawnAgents, finalAnswer } =
+      parseMainReactResponse(text);
+
+    if (finalAnswer) {
+      this.steps.push({
+        step,
+        action: "FINAL_ANSWER",
+        thought,
+        observation: finalAnswer,
+      });
+      return { isComplete: true, needsMoreInfo: false, answer: finalAnswer };
+    }
+
+    const hasActions = actions.length > 0;
+    const hasDelegates = delegates.length > 0;
+    const hasSpawn = spawnAgents.length > 0;
+    const hasPlan = !!plan;
+
+    // 无任何可推进内容 → NO_ACTION
+    if (!hasPlan && !hasActions && !hasDelegates && !hasSpawn) {
+      this.steps.push({
+        step,
+        action: "NO_ACTION",
+        thought,
+        observation: "无法解析的响应，继续下一步",
+      });
+      await this.contextManager.addMessagesBatch([
+        { role: "assistant", content: thought || "(无有效输出)" },
+      ]);
+      return { isComplete: false, needsMoreInfo: false, answer: "" };
+    }
+
+    // PLAN / 工具采集 / 子智能体委派可同时推进，结果统一落库供下一步思考
+    const observations: Array<Omit<Message, "timestamp" | "tokenCount">> = [];
+
+    // 记录 PLAN（若有），写入上下文供后续步骤参考策略
+    if (hasPlan) {
+      this.steps.push({
+        step,
+        action: "PLAN",
+        thought,
+        observation: plan,
+        plan,
+      });
+      observations.push({ role: "assistant", content: `[PLAN] ${plan}` });
+    }
+
+    // 先注册动态 agent（若有），使其本轮即可被 DELEGATE
+    // 注册失败记为观察，不阻断其余 actions/delegates
+    if (hasSpawn) {
+      for (const sp of spawnAgents) {
+        try {
+          this.scheduler.registerDynamicAgent(sp);
+          this.steps.push({
+            step,
+            action: `SPAWN_AGENT → ${sp.id}`,
+            thought,
+            observation: `role=${sp.role}, tools=${sp.toolNames.join(", ")}`,
+          });
+        } catch (err: any) {
+          this.steps.push({
+            step,
+            action: `SPAWN_AGENT → ${sp.id}`,
+            thought,
+            observation: `[注册失败] ${err.message}`,
+          });
+          observations.push({
+            role: "assistant",
+            content: `[动态注册失败] ${sp.id}: ${err.message}`,
+          });
+        }
+      }
+    }
+
+    const actionTask: Promise<ActionResult[]> = hasActions
+      ? this.toolExecutor
+        ? this.toolExecutor.executeBatch(actions)
+        : this.fallbackExecuteBatch(actions)
+      : Promise.resolve<ActionResult[]>([]);
+    const delegateTask: Promise<DispatchResult[]> = hasDelegates
+      ? this.scheduler.dispatchConcurrent(
+          delegates.map((agentId) => ({
+            agentId,
+            task: this.buildDelegateTask(thought, userTask),
+          }))
+        )
+      : Promise.resolve<DispatchResult[]>([]);
+
+    const [actionResults, delegateResults] = await Promise.all([
+      actionTask,
+      delegateTask,
+    ]);
+
+    for (const r of actionResults) {
+      this.steps.push({
+        step,
+        action: `TOOL: ${r.toolName}(${JSON.stringify(r.toolArgs)})`,
+        thought,
+        observation: r.result,
+      });
+      observations.push({
+        role: "tool",
+        content: `[${r.toolName}] ${JSON.stringify(r.toolArgs)} → ${r.result}`,
+      });
+    }
+    for (const d of delegateResults) {
+      this.steps.push({
+        step,
+        action: `DELEGATE → ${d.agentId}`,
+        thought,
+        observation: d.result,
+        agentId: d.agentId,
+      });
+      observations.push({
+        role: "assistant",
+        content: `[调度给 ${d.agentId}] ${thought} → ${d.result}`,
+      });
+    }
+
+    await this.contextManager.addMessagesBatch(observations);
+    return { isComplete: false, needsMoreInfo: false, answer: "" };
+  }
+
+  /** toolExecutor 缺失时的回退执行（串行） */
+  private async fallbackExecuteBatch(
+    actions: PlannedAction[]
+  ): Promise<ActionResult[]> {
+    const results: ActionResult[] = [];
+    for (const a of actions) {
+      try {
+        const result = await this.toolRegistry.execute(a.toolName, a.toolArgs);
+        results.push({
+          toolName: a.toolName,
+          toolArgs: a.toolArgs,
+          success: true,
+          result,
+        });
+      } catch (err: any) {
+        results.push({
+          toolName: a.toolName,
+          toolArgs: a.toolArgs,
+          success: false,
+          result: `工具执行失败: ${err.message}`,
+        });
+      }
+    }
+    return results;
+  }
+
+  /** 构造给子智能体的任务（含主控思考与原始任务上下文） */
+  private buildDelegateTask(thought: string, userTask: string): string {
+    return `${thought}\n\n[原始任务上下文] ${userTask}`;
+  }
+}

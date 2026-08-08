@@ -1,0 +1,33 @@
+{
+  "name": "flagent",
+  "version": "0.1.0",
+  "description": "Flagent Multi-Agent System - 基于 Vercel AI SDK 的多智能体协作框架",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "flagent": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli/index.js",
+    "dev": "tsc && node dist/cli/index.js",
+    "cli": "node dist/cli/index.js",
+    "test": "node tests/stage0.test.js && node tests/stage1.test.js && node tests/stage2.test.js && node tests/stage3.test.js && node tests/stage4.test.js && node tests/stage5.test.js && node tests/stage6.test.js && node tests/stage7.test.js && node tests/stage8.test.js && node tests/stage9.test.js && node tests/stage10.test.js && node tests/edge-cases.test.js",
+    "test:unit": "node tests/stage0.test.js && node tests/stage1.test.js && node tests/stage2.test.js && node tests/stage3.test.js && node tests/stage4.test.js && node tests/stage5.test.js && node tests/stage6.test.js && node tests/stage7.test.js && node tests/stage8.test.js && node tests/stage9.test.js && node tests/stage10.test.js && node tests/edge-cases.test.js",
+    "test:e2e": "node tests/e2e-mainagent.test.js && node tests/e2e-stage7.test.js && node tests/e2e-stage8.test.js && node tests/e2e-stage9.test.js && node tests/e2e-stage10.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.34",
+    "ai": "^7.0.56",
+    "dotenv": "^17.4.2",
+    "openai": "^7.4.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  }
+}
