@@ -257,6 +257,35 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
     if (thought) this.emitEvent({ type: "thought", step, thought });
 
     if (finalAnswer) {
+      // ============================================================
+      // CTF 任务 final answer 前置检查：
+      //   若 finalAnswer 写了 "Flag: 无" 或没有出现可验证的 flag 格式，
+      //   且用户任务/历史中出现过 CTF 相关关键词（flag/ctf/pwn/附件/题目 等），
+      //   则不提交 final，改为把 self-reflection 观察写入上下文，
+      //   让 LLM 下一轮继续 debug 迭代（直到工具 [FLAG FOUND] 被检测到）。
+      // ============================================================
+      const guard = validateCTFFinalAnswer(finalAnswer, userTask, historyText, summary || "");
+      if (!guard.ok) {
+        // 把校验失败 + 具体的 debug 建议写进上下文，相当于强制一轮 self-reflection
+        this.steps.push({
+          step,
+          action: "FINAL_ANSWER_GUARD",
+          thought,
+          observation: guard.reason + "\n" + guard.hint,
+        });
+        await this.contextManager.addMessagesBatch([
+          { role: "assistant", content: `[计划]\n${plan || ""}\n\n[思考]\n${thought || ""}\n\n[尝试的 FINAL_ANSWER]\n${finalAnswer}\n\n[系统校验：不通过]\n${guard.reason}\n\n[请按以下调试建议继续迭代（不要 FINAL_ANSWER 交卷）]\n${guard.hint}` },
+          { role: "user", content:
+`收到。请不要直接 FINAL_ANSWER，而是基于上一轮的执行结果做下一轮迭代调试：
+1. 重新精读最近 2~3 条工具结果的末尾（特别是 bytes 尾部、[NO FLAG FOUND]、[FLAG FOUND] 行），判断上一轮 exploit 为什么没触发 win
+2. 用 pwn_run_exploit 调试：调整偏移、写入字节数、cat flag 命令、sleep 时间
+3. 有条件本地调试的，先本地确认 payload 正确性再打远程
+4. 只有当工具输出里出现明确的 [FLAG FOUND] 或 flag{xxx}/ctfhub{xxx} 完整匹配时才能 FINAL_ANSWER 交卷` },
+        ]);
+        this.emitEvent({ type: "thought", step, thought: "⚠️  Flag 校验未通过：" + guard.reason + " 继续下一轮 debug。" });
+        return { isComplete: false, needsMoreInfo: false, answer: "" };
+      }
+
       this.emitEvent({ type: "finalAnswer", step, answer: finalAnswer });
       this.steps.push({
         step,
@@ -463,4 +492,98 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
   private buildDelegateTask(thought: string, userTask: string): string {
     return `${thought}\n\n[原始任务上下文] ${userTask}`;
   }
+}
+
+/**
+ * CTF 类任务 Final Answer 校验器：防止 Agent "Flag: 无" 就交卷。
+ * 校验逻辑：
+ *   1) 先判断是否为 CTF 类任务（用户任务/历史/摘要含关键词）
+ *      关键词 flag/ctf/pwn/reverse/附件/题目/靶机/靶场/crypto/web…
+ *   2) 非 CTF 类：一律放行（纯聊天、CRUD、部署等不卡）
+ *   3) 是 CTF 类但 finalAnswer 含 "Flag: 无" / "未获取" 等无 flag 措辞 → 拦截
+ *   4) 是 CTF 类且 finalAnswer 中确实含 1+ 条可验证 flag 格式（<平台>{...}，≥ 6 字符） → 通过
+ *   5) 未命中 → 拦截，并给出具体 debug 建议
+ */
+function validateCTFFinalAnswer(
+  finalAnswer: string,
+  userTask: string,
+  historyText: string,
+  summary: string
+): { ok: boolean; reason: string; hint: string } {
+  const combinedContext = `${userTask}\n${historyText}\n${summary}`.toLowerCase();
+  const ctfKeywords = [
+    "flag", "ctf", "pwn", "reverse", "crypto",
+    "附件", "题目", "靶机", "靶场", "challenge",
+    "ctfhub", "ctftime", "ctfshow",
+    "antiy", "buu", "攻防世界", "hgame", "xctf",
+  ];
+  const isCTFTask = ctfKeywords.some((k) => combinedContext.includes(k));
+  if (!isCTFTask) {
+    return { ok: true, reason: "非 CTF 类任务，跳过 Flag 校验。", hint: "" };
+  }
+
+  const faLower = finalAnswer.toLowerCase();
+  const hasExplicitNo =
+    /flag\s*[:：]\s*无/.test(finalAnswer) ||
+    /flag\s*[:：]\s*未/.test(finalAnswer) ||
+    /未从远程获取/.test(finalAnswer) ||
+    /需实际执行获取/.test(finalAnswer) ||
+    /flag.{0,20}(未|无|没)/.test(faLower);
+
+  const flagPatterns = [
+    /flag\{[^}\n\r]{1,128}\}/i,
+    /CTF\{[^}\n\r]{1,128}\}/,
+    /ctfhub\{[^}\n\r]{1,128}\}/,
+    /picoCTF\{[^}\n\r]{1,128}\}/,
+    /FLAG\{[^}\n\r]{1,128}\}/,
+    /HITS\{[^}\n\r]{1,128}\}/,
+    /DASCTF\{[^}\n\r]{1,128}\}/,
+    // 兜底：任意 <平台>{<内容≥3 字符>}
+    /[A-Za-z0-9_]{1,32}\{[^}\n\r]{3,128}\}/,
+  ];
+  const matched = flagPatterns
+    .map((re) => finalAnswer.match(re))
+    .filter((m): m is RegExpMatchArray => !!m)
+    .map((m) => m[0])
+    .filter((c) => c.length >= 6);
+
+  // 去重
+  const unique = Array.from(new Set(matched));
+  if (unique.length > 0) {
+    return {
+      ok: true,
+      reason: `检测到 ${unique.length} 条 flag 匹配：${unique.join(", ")}`,
+      hint: "",
+    };
+  }
+
+  if (hasExplicitNo) {
+    return {
+      ok: false,
+      reason: "Final Answer 中声明 'Flag: 无/未获取/需实际执行'，但这是一道 CTF 类任务 → 必须继续 debug 到拿到真实 flag 再交卷。",
+      hint:
+        "调试 checklist：\n" +
+        "  (a) 回顾最后 2~3 条工具结果末尾：有没有 [NO FLAG FOUND] / [FLAG FOUND] 标记？\n" +
+        "      有 [NO FLAG FOUND] → 按它下面的 5 条建议改 exploit\n" +
+        "  (b) pwn 类：用 pwn_run_exploit（不要 file_write_real + python3 -c），脚本结尾一定要\n" +
+        "      发多条命令：cat flag\\ncat /flag\\nls -la /\\nfind / -name 'flag*' 2>/dev/null\\n，\n" +
+        "      且最后一个 send 后 sleep(1~2s) + while recv，避免 shell 输出被截断\n" +
+        "  (c) web：重新检查 HTTP 200 页面中有没有注释/源码里的 flag，flag 不在 body 里也可能在响应头\n" +
+        "  (d) crypto：检查 decode 输出的字节，不要只看 repr\n" +
+        "  (e) 题目有明确平台前缀的：调用工具时传 flagRegex='ctfhub\\\\{[^}]+\\\\}'（或对应平台名）精确扫",
+    };
+  }
+
+  // 既没匹配 flag，又没写 "Flag: 无" → 可能漏扫或平台名特殊
+  return {
+    ok: false,
+    reason: "这是 CTF 类任务，但 Final Answer 里未出现可验证的 flag{xxx}/ctfhub{xxx}/平台名{xxx} 格式匹配。\n" +
+      "请确认 flag 是否真的拿到，或改用工具自动扫描（pwn_run_exploit / nc_remote_client 已内置扫描）。",
+    hint:
+      "处理建议：\n" +
+      "  1) 重新看工具输出的最后一段 bytes 尾部/hex 尾部：flag 可能在乱码之后\n" +
+      "  2) 未执行 exploit → 先写 exploit 跑一次再交卷\n" +
+      "  3) 平台前缀未知：用 flagRegex='[A-Za-z0-9_]+\\\\{[^}]+\\\\}' 兜底再扫\n" +
+      "  4) 真的确认无 flag 且题目是分析类 → 写完整推导并在 Writeup 里说明 '题目预期输出分析结论而非 flag'，但这是极少数情况",
+  };
 }

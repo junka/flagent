@@ -103,19 +103,25 @@ export class ContextManager {
    * 手动触发摘要（/summarize 命令）：将窗口外的消息摘要后截断，返回当前摘要。
    * 全部消息都在窗口内时无需摘要，返回已有摘要（可能为空）。
    * 与自动 checkAndSummarize 共用 summarizeMessages，串行化于 writeLock。
+   * LLM 失败（额度用尽/403/网络错）时不抛，返回已有 summary（降级），保证不打断主流程。
    */
   async summarizeNow(): Promise<string> {
-    return this.runLocked(async () => {
-      if (this.messages.length > this.config.windowMessages) {
-        const nonWindow = this.messages.slice(
-          0,
-          this.messages.length - this.config.windowMessages
-        );
-        await this.summarizeMessages(nonWindow);
-        this.messages = this.messages.slice(-this.config.windowMessages);
-      }
+    try {
+      return await this.runLocked(async () => {
+        if (this.messages.length > this.config.windowMessages) {
+          const nonWindow = this.messages.slice(
+            0,
+            this.messages.length - this.config.windowMessages
+          );
+          await this.summarizeMessages(nonWindow);
+          this.messages = this.messages.slice(-this.config.windowMessages);
+        }
+        return this.summary;
+      });
+    } catch (error) {
+      console.warn("[ContextManager] summarizeNow 降级（LLM 失败），保留原消息:", (error as Error).message);
       return this.summary;
-    });
+    }
   }
 
   private runLocked<T>(fn: () => Promise<T>): Promise<T> {
@@ -128,6 +134,12 @@ export class ContextManager {
     return Math.ceil(text.length / 4);
   }
 
+  /**
+   * 自动摘要：token 超阈值时触发。
+   * LLM 失败（403 Forbidden / 额度用尽 / 网络）时 try/catch 降级，不抛出，
+   * 确保不把异常冒泡到 addMessage / 主流程导致会话整体报错。
+   * 消息保持原样，下次 token 更高或 API 恢复时仍有机会再尝试摘要。
+   */
   private async checkAndSummarize(): Promise<void> {
     const totalTokens = this.getTotalTokens();
     if (totalTokens > this.config.summaryThresholdTokens) {
@@ -136,8 +148,16 @@ export class ContextManager {
         this.messages.length - this.config.windowMessages
       );
       if (nonWindowMessages.length > 0) {
-        await this.summarizeMessages(nonWindowMessages);
-        this.messages = this.messages.slice(-this.config.windowMessages);
+        try {
+          await this.summarizeMessages(nonWindowMessages);
+          this.messages = this.messages.slice(-this.config.windowMessages);
+        } catch (error) {
+          console.warn(
+            `[ContextManager] 自动摘要降级（LLM 失败，保留原消息，当前 ${totalTokens} tokens）:`,
+            (error as Error).message
+          );
+          // 不截断 messages（摘要失败就不丢原对话），下次 addMessage 再试
+        }
       }
     }
   }

@@ -7,7 +7,8 @@ import {
   type GlobalConfig,
 } from "../config/global-config";
 
-dotenv.config();
+// quiet: 抑制 dotenv 17 的 "injected env" 启动提示，避免干扰 CLI 输出
+dotenv.config({ quiet: true });
 
 export type { Platform };
 

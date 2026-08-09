@@ -11,6 +11,132 @@ import type { AgentEvent } from "../agents/agent-events";
 // 兼容旧 import 路径（tests 仍从 dist/cli/index 取 createAgentSystem / createToolRegistry）
 export { createAgentSystem, createToolRegistry, type AgentSystem };
 
+/**
+ * LLM API 错误分类结果。纯函数，无运行时依赖，便于单测。
+ * tips 中的 {model} / {baseUrl} 占位符由调用方（CLI）用 getLLMConfig() 替换。
+ */
+export interface LLMErrorDiagnosis {
+  kind: "arrearage" | "quota" | "auth" | "model" | "network" | "unknown";
+  tag: string;
+  detail: string;
+  tips: string[];
+}
+
+/**
+ * 识别 LLM API 级错误（欠费/额度/鉴权/模型不支持/网络），返回可操作诊断。
+ * ai-sdk 的 APICallError: message 仅是 HTTP 描述(如"Bad Request")，真实业务信息在 responseBody。
+ */
+export function classifyLLMError(error: any): LLMErrorDiagnosis {
+  const httpMsg = String(error && error.message ? error.message : error);
+  const statusCode = Number(error && error.statusCode) || 0;
+  let bodyCode = "";
+  let bodyMsg = "";
+  const rawBody = error && error.responseBody ? String(error.responseBody) : "";
+  if (rawBody) {
+    try {
+      const parsed = JSON.parse(rawBody);
+      bodyCode = parsed && parsed.code ? String(parsed.code) : "";
+      bodyMsg = parsed && parsed.message ? String(parsed.message) : "";
+    } catch {
+      bodyMsg = rawBody.slice(0, 300);
+    }
+  }
+  const fullText = (httpMsg + " " + bodyCode + " " + bodyMsg + " " + (error && error.data ? String(error.data) : "")).toLowerCase();
+  const detail = bodyMsg ? (bodyCode ? "[" + bodyCode + "] " + bodyMsg : bodyMsg) : httpMsg;
+
+  const isArrearage =
+    bodyCode.toLowerCase().includes("arrearage") ||
+    fullText.includes("arrearage") ||
+    fullText.includes("in good standing") ||
+    fullText.includes("overdue") ||
+    fullText.includes("欠费") ||
+    fullText.includes("结清");
+  if (isArrearage) {
+    return {
+      kind: "arrearage",
+      tag: "💳 LLM 账户欠费（Arrearage）",
+      detail,
+      tips: [
+        "1) 阿里云费用账单结清欠费（欠费会导致所有模型 400 拦截）",
+        "2) 错误说明与充值指引: https://help.aliyun.com/zh/model-studio/error-code#overdue-payment",
+        "3) 结清后稍等几分钟生效，再重试；或 /model 切换到免费额度内的模型",
+        "4) /platform qianwen|bailian 切换端点（两个平台计费独立，可能其一未欠费）",
+      ],
+    };
+  }
+  const isQuota =
+    fullText.includes("forbidden") ||
+    fullText.includes("quota") ||
+    fullText.includes("permission_denied") ||
+    fullText.includes("free quota exhausted") ||
+    statusCode === 403 ||
+    statusCode === 429;
+  if (isQuota) {
+    return {
+      kind: "quota",
+      tag: "🔒 LLM 访问受限（额度/权限/频率）",
+      detail,
+      tips: [
+        '1) 阿里云控制台 / 百炼工作台：充值或关闭"仅使用免费额度"',
+        "2) /model 列出可用模型，切到其他已开通 PTU/按量的模型",
+        "3) /platform qianwen (或 /platform bailian) 切换端点，可能可用额度不同",
+        "4) 检查 key 是否归属正确阿里云账号下的工作空间",
+      ],
+    };
+  }
+  const isAuth =
+    fullText.includes("authentication") ||
+    fullText.includes("invalid api") ||
+    fullText.includes("unauthorized") ||
+    statusCode === 401;
+  if (isAuth) {
+    return {
+      kind: "auth",
+      tag: "🔐 LLM 鉴权失败（API Key）",
+      detail,
+      tips: [
+        "1) 环境变量 DASHSCOPE_API_KEY 是否设置（CLI 全局安装需手动 export）",
+        "2) Key 是否启用、未吊销、非空字符串",
+        "3) VSCode: 设置 flagent.apiKey 并重载（命令 > Flagent: Reload LLM Config）",
+      ],
+    };
+  }
+  const isModelUnsupported =
+    (statusCode === 400 || statusCode === 404) &&
+    (fullText.includes("model") || fullText.includes("not found") || fullText.includes("does not exist") || fullText.includes("unsupported"));
+  if (isModelUnsupported) {
+    return {
+      kind: "model",
+      tag: "🤖 LLM 模型不可用",
+      detail,
+      tips: [
+        "1) /model 查看可用模型列表，当前 {model} 可能在该平台未开通/已下线",
+        "2) /platform 切换平台后重试（千问与百炼支持的模型集合不同）",
+        "3) 阿里云控制台确认该模型已申请开通/开通按量付费",
+      ],
+    };
+  }
+  const isNetwork =
+    fullText.includes("network") ||
+    fullText.includes("econn") ||
+    fullText.includes("fetch failed") ||
+    fullText.includes("timeout") ||
+    fullText.includes("etimedout");
+  if (isNetwork) {
+    return {
+      kind: "network",
+      tag: "🌐 LLM 调用网络问题",
+      detail,
+      tips: [
+        "1) 本机是否能联网: curl -I {baseUrl}",
+        "2) 是否走代理；必要时 HTTPS_PROXY=http://proxy:port 开启",
+        "3) 百炼平台 workspaceId 是否正确且该工作空间已开通网络出网",
+      ],
+    };
+  }
+  return { kind: "unknown", tag: "", detail, tips: [] };
+}
+
 /** 启动 BANNER：动态读 getLLMConfig()，反映 platform/model/workspace/key 当前态。 */
 function renderBanner(): string {
   const cfg = getLLMConfig();
@@ -582,7 +708,20 @@ export async function startCLI(): Promise<void> {
     try {
       await sessionManager.run(input, { onEvent, confirmPlan });
     } catch (error: any) {
-      console.error(`\n❌ 执行出错: ${error.message}\n`);
+      const d = classifyLLMError(error);
+      if (d.kind !== "unknown") {
+        const cfg = getLLMConfig();
+        console.error("\n❌ " + d.tag + ": " + d.detail + "\n");
+        console.error("  当前平台: " + cfg.platform + "  模型: " + cfg.modelName + "  baseUrl: " + cfg.baseUrl);
+        console.error("  API Key: " + (cfg.apiKey ? "已设置（长度" + cfg.apiKey.length + "）" : "未设置 ⚠️"));
+        console.error("  建议:");
+        for (const tip of d.tips) {
+          console.error("    " + tip.replace("{model}", cfg.modelName).replace("{baseUrl}", cfg.baseUrl));
+        }
+        console.error("");
+      } else {
+        console.error("\n❌ 执行出错: " + d.detail + "\n");
+      }
     } finally {
       mainAgentRunning = false;
     }
