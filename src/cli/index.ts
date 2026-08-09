@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import readline from "readline";
-import { API_KEY, MODEL_NAME, WORKSPACE_ID } from "../llm/client";
+import { getLLMConfig, setLLMConfig, listAvailableModels } from "../llm/client";
+import { writeGlobalConfig, type Platform } from "../config/global-config";
 import { createAgentSystem, type AgentSystem } from "../agents/factory";
 import { createToolRegistry } from "../tools/factory";
 import { SessionManager } from "../session/session-manager";
@@ -10,16 +11,23 @@ import type { AgentEvent } from "../agents/agent-events";
 // 兼容旧 import 路径（tests 仍从 dist/cli/index 取 createAgentSystem / createToolRegistry）
 export { createAgentSystem, createToolRegistry, type AgentSystem };
 
-const BANNER = `
+/** 启动 BANNER：动态读 getLLMConfig()，反映 platform/model/workspace/key 当前态。 */
+function renderBanner(): string {
+  const cfg = getLLMConfig();
+  const platformLabel = cfg.platform === "qianwen" ? "千问平台" : "百炼平台";
+  const ws =
+    cfg.platform === "bailian" && cfg.workspaceId ? cfg.workspaceId : "(无)";
+  return `
 ╔══════════════════════════════════════════════════════════════╗
 ║                    Flagent Multi-Agent System                ║
-║                    多智能体协作系统                          ║
+║                    多智能体CTF协作系统                       ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Model: ${MODEL_NAME.padEnd(56)}  ║
-║  Workspace: ${WORKSPACE_ID.padEnd(50)}  ║
-║  API Key: ${API_KEY ? "✓ 已配置".padEnd(52) : "✗ 未配置".padEnd(52)}  ║
-╚══════════════════════════════════════════════════════════════╝
-`;
+║  Platform: ${platformLabel.padEnd(51)}  ║
+║  Model:    ${cfg.modelName.padEnd(51)}  ║
+║  Workspace:${ws.padEnd(51)}  ║
+║  API Key:  ${(cfg.apiKey ? "✓ 已配置" : "✗ 未配置").padEnd(51)}  ║
+╚══════════════════════════════════════════════════════════════╝`;
+}
 
 const HELP_TEXT = `
 会话管理（每会话独立上下文/权限/动态 agent，可同时分析多题）:
@@ -28,6 +36,10 @@ const HELP_TEXT = `
   /switch <id>       切换到指定会话（不在内存则从磁盘恢复）
   /delete <id>       删除指定会话（内存 + 磁盘）
   /title [标题]      查看或设置当前会话标题
+
+LLM 配置（全局，写入 ~/.flagent/config.json，重启后生效）:
+  /platform [平台]   切换平台（qianwen 千问 / bailian 百炼）；无参显示当前
+  /model [名称]      列出可用模型或切换模型（/model <name>）；切换写回全局配置
 
 会话内命令:
   /help              显示帮助信息
@@ -73,7 +85,7 @@ function preview(text: string, max = 100): string {
 }
 
 export async function startCLI(): Promise<void> {
-  console.log(BANNER);
+  console.log(renderBanner());
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -158,6 +170,76 @@ export async function startCLI(): Promise<void> {
       console.log(
         `\n🔊 思考过程显示已${verbose ? "开启" : "关闭"}（${verbose ? "完整思考与工具结果" : "精简摘要"}）。\n`
       );
+      rl.prompt();
+      return;
+    }
+
+    // /platform [qianwen|bailian] —— 切换平台，写回全局配置
+    if (input === "/platform" || input.startsWith("/platform ")) {
+      const arg = input.slice(9).trim().toLowerCase();
+      if (!arg) {
+        const cfg = getLLMConfig();
+        console.log(`\n🖥️  当前平台: ${cfg.platform === "qianwen" ? "千问" : "百炼"}`);
+        console.log(`  baseUrl: ${cfg.baseUrl}`);
+        console.log(`  切换: /platform qianwen  或  /platform bailian`);
+        console.log(
+          `  - 千问: https://dashscope.aliyuncs.com/compatible-mode/v1（无需 workspaceId）`
+        );
+        console.log(
+          `  - 百炼: https://{workspaceId}.cn-beijing.maas.aliyuncs.com/...（需 workspaceId）`
+        );
+      } else if (arg === "qianwen" || arg === "bailian") {
+        setLLMConfig({ platform: arg as Platform });
+        writeGlobalConfig({ platform: arg as Platform });
+        const cfg = getLLMConfig();
+        console.log(`\n🖥️  平台已切换: ${arg === "qianwen" ? "千问" : "百炼"}`);
+        console.log(`  baseUrl: ${cfg.baseUrl}`);
+        console.log(`  已写入全局配置 (~/.flagent/config.json)，重启后生效`);
+      } else {
+        console.log(`\n⚠️  用法: /platform [qianwen|bailian]`);
+      }
+      rl.prompt();
+      return;
+    }
+
+    // /model [名称] —— 列出可用模型或切换模型，写回全局配置
+    if (input === "/model" || input.startsWith("/model ")) {
+      const arg = input.slice(6).trim();
+      if (!arg) {
+        console.log("\n📋 正在拉取可用模型列表...");
+        try {
+          const models = await listAvailableModels();
+          const cfg = getLLMConfig();
+          // 按类别分组展示
+          const byCategory = new Map<string, typeof models>();
+          for (const m of models) {
+            if (!byCategory.has(m.category)) byCategory.set(m.category, []);
+            byCategory.get(m.category)!.push(m);
+          }
+          const order = ["对话", "视觉语言", "嵌入", "重排", "图像", "情感", "动作"];
+          for (const cat of order) {
+            const list = byCategory.get(cat);
+            if (!list || list.length === 0) continue;
+            console.log(`\n  【${cat}】`);
+            for (const m of list) {
+              const mark = m.name === cfg.modelName ? "*" : " ";
+              console.log(`  ${mark} ${m.name}  [plans: ${m.plans.join("/")}]`);
+            }
+          }
+          console.log(`\n  * = 当前模型 (${cfg.modelName})`);
+          console.log(`  切换: /model <名称>（如 /model qwen-plus）`);
+        } catch (err: any) {
+          console.log(`\n❌ 拉取模型列表失败: ${err.message}`);
+          console.log(`  可直接用 /model <名称> 切换（需已知模型名）`);
+        }
+      } else {
+        setLLMConfig({ modelName: arg });
+        writeGlobalConfig({ modelName: arg });
+        const cfg = getLLMConfig();
+        console.log(`\n🤖 模型已切换: ${arg}`);
+        console.log(`  当前平台: ${cfg.platform}, baseUrl: ${cfg.baseUrl}`);
+        console.log(`  已写入全局配置 (~/.flagent/config.json)，重启后生效`);
+      }
       rl.prompt();
       return;
     }
@@ -433,14 +515,14 @@ export async function startCLI(): Promise<void> {
           const r = event.result;
           const mark = r.success ? "✓" : "✗";
           const skipped = r.skipped ? "（跳过）" : "";
-          console.log(`     ${mark} ${r.toolName}${skipped}: ${preview(r.result, 100)}`);
-          if (verbose && r.result.length > 100)
-            console.log(indent(r.result, "        "));
+          // 工具结果完整打印（不截断），保留原换行 + 缩进，便于人类观察关键线索
+          console.log(`     ${mark} ${r.toolName}${skipped}:`);
+          console.log(indent(r.result, "        "));
           break;
         }
 
         case "actionEnd":
-          // 精简模式下 toolEnd 已实时打印每个工具；verbose 在 toolEnd 已展开结果，此处不重复
+          // toolEnd 已实时完整打印每个工具结果，此处不重复
           break;
 
         case "delegateStart":
@@ -450,9 +532,8 @@ export async function startCLI(): Promise<void> {
         case "delegateEnd":
           for (const d of event.results) {
             const mark = d.success ? "✓" : "✗";
-            console.log(`     ${mark} ${d.agentId}: ${preview(d.result, 100)}`);
-            if (verbose && d.result.length > 100)
-              console.log(indent(d.result, "        "));
+            console.log(`     ${mark} ${d.agentId}:`);
+            console.log(indent(d.result, "        "));
           }
           break;
 
@@ -466,8 +547,12 @@ export async function startCLI(): Promise<void> {
         }
 
         case "finalAnswer":
-          console.log(`\n✅ 最终回答：`);
-          console.log(indent(event.answer, "   "));
+          console.log(`\n${"─".repeat(56)}`);
+          console.log(`✅ 最终回答：`);
+          console.log("─".repeat(56));
+          // writeup 为多行结构化内容，原样打印保留格式（避免缩进破坏编号/代码块）
+          console.log(event.answer);
+          console.log("─".repeat(56));
           break;
 
         case "stepEnd":

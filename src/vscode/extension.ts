@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as os from "os";
-import { createToolRegistry, setLLMConfig, getLLMConfig, type LLMConfig } from "..";
+import { createToolRegistry, setLLMConfig, getLLMConfig, type LLMConfig, type Platform } from "..";
 import { SessionManager, type SessionListItem } from "../session";
 import { SessionTreeProvider } from "./session-tree-provider";
 
@@ -455,18 +455,23 @@ export class FlagentExtension {
   // ---------- LLM 配置接入 ----------
 
   /**
-   * 从 VSCode 设置读取 flagent.apiKey / workspaceId / model，注入到 LLM 客户端。
-   * 空字符串或未设置的字段不覆盖（保留 .env 中的默认值）。
+   * 从 VSCode 设置读取 flagent.apiKey / workspaceId / model / platform，注入到 LLM 客户端。
+   * 空字符串或未设置的字段不覆盖（保留全局配置/.env 中的默认值）。
    */
   private applyConfigFromVSCode(): LLMConfig {
     const cfg = vscode.workspace.getConfiguration("flagent");
     const apiKey = cfg.get<string>("apiKey")?.trim();
     const workspaceId = cfg.get<string>("workspaceId")?.trim();
     const modelName = cfg.get<string>("model")?.trim();
+    const platform = cfg.get<string>("platform")?.trim().toLowerCase();
     return setLLMConfig({
       apiKey: apiKey ? apiKey : undefined,
       workspaceId: workspaceId ? workspaceId : undefined,
       modelName: modelName ? modelName : undefined,
+      platform:
+        platform === "qianwen" || platform === "bailian"
+          ? (platform as Platform)
+          : undefined,
     });
   }
 
@@ -478,13 +483,14 @@ export class FlagentExtension {
       before.apiKey !== after.apiKey ||
       before.workspaceId !== after.workspaceId ||
       before.modelName !== after.modelName ||
-      before.baseUrl !== after.baseUrl;
+      before.baseUrl !== after.baseUrl ||
+      before.platform !== after.platform;
     vscode.window.showInformationMessage(
       `Flagent LLM 配置${changed ? "已刷新" : "未变化"}：` +
-        `workspaceId=${after.workspaceId}, model=${after.modelName}, key=${after.apiKey ? "✓已设置" : "✗未设置"}`
+        `platform=${after.platform}, workspaceId=${after.workspaceId}, model=${after.modelName}, key=${after.apiKey ? "✓已设置" : "✗未设置"}`
     );
     this.outputChannel.appendLine(
-      `[config] ${changed ? "changed" : "unchanged"}  ws=${after.workspaceId} model=${after.modelName} keyLen=${after.apiKey.length}`
+      `[config] ${changed ? "changed" : "unchanged"}  platform=${after.platform} ws=${after.workspaceId} model=${after.modelName} keyLen=${after.apiKey.length}`
     );
   }
 

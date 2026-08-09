@@ -228,6 +228,26 @@ async function main() {
     assert(f("1、a\n2、b", 0, 0) === true, "顿号编号 2 步骤 → true");
   }
 
+  // 测试8：多行 writeup FINAL_ANSWER 解析完整性
+  console.log("\n=== 测试8: 多行 writeup FINAL_ANSWER 解析 ===");
+  {
+    const { parseMainReactResponse } = require("../dist/agents/react-parser");
+    const multiLine =
+      "THOUGHT: 已拿到 flag\n" +
+      "FINAL_ANSWER: Flag: flag{ctfhub{abc123}}\n" +
+      "Writeup:\n" +
+      "1. 访问 http://target/phpinfo.php，观察首页提示\n" +
+      "2. 在 phpinfo 输出的 Environment 段查找 FLAG 字段\n" +
+      "3. 复制 flag 值提交";
+    const parsed = parseMainReactResponse(multiLine);
+    assert(parsed.finalAnswer.includes("flag{ctfhub{abc123}}"), "finalAnswer 含 flag");
+    assert(parsed.finalAnswer.includes("Writeup:"), "finalAnswer 含 Writeup 段");
+    assert(parsed.finalAnswer.includes("1. 访问"), "finalAnswer 含步骤1");
+    assert(parsed.finalAnswer.includes("3. 复制 flag"), "finalAnswer 含步骤3");
+    assert(parsed.actions.length === 0, "无 ACTIONS");
+    assert(!parsed.plan, "无 PLAN");
+  }
+
   console.log(`\n=== 结果: ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

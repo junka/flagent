@@ -48,4 +48,4 @@ export {
   type SerializableMessage,
   type MessageRole,
 } from "./session";
-export { model, API_KEY, MODEL_NAME, WORKSPACE_ID, BASE_URL, getLLMConfig, setLLMConfig, type LLMConfig } from "./llm/client";
+export { model, API_KEY, MODEL_NAME, WORKSPACE_ID, BASE_URL, PLATFORM, getLLMConfig, setLLMConfig, listAvailableModels, classifyModel, type LLMConfig, type Platform, type ModelInfo } from "./llm/client";

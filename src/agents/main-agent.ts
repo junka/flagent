@@ -231,7 +231,12 @@ ACTIONS:
   - <工具名>({...参数JSON...})
 SPAWN_AGENT: {"id":"gen-xxx","name":"...","role":"...","systemPrompt":"...","toolNames":["t1","t2"]}
 DELEGATE: <agentId1>, <agentId2>
-FINAL_ANSWER: [任务完成时的最终答案]
+FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类任务必须按以下结构输出，让读者能手动逐步复现：
+  Flag: <flag 值；若无写"无">
+  Writeup:
+  1. <步骤：具体操作（命令/URL/动作）+ 关键观察 + 推理依据>
+  2. <步骤...>
+  ...（覆盖从入手到拿到 flag 的完整链路，命令需可复制执行）]
 
 规则：
 - 优先并发只读采集（ACTIONS 多个只读工具同时跑），再统一思考
@@ -239,7 +244,7 @@ FINAL_ANSWER: [任务完成时的最终答案]
 - 仅当子任务需独立多步深挖或输出较大时才 DELEGATE 给已有 agent
 - 仅当任务不落进任一预设 agent 类别、且需要独立深挖时，才 SPAWN_AGENT 自定义通用 agent（id 须唯一、toolNames 必须来自上方可用工具），随后 DELEGATE 给它
 - 工具调用格式必须为 工具名(JSON参数)
-- 任务完成输出 FINAL_ANSWER，简单任务可直接回答`;
+- 解题/分析类任务的 FINAL_ANSWER 必须含 Flag + 可手动复现的逐步 Writeup（每步写清：操作、观察、推理）；简单问答可直接回答`;
 
     const { text } = await generateText({
       model,
