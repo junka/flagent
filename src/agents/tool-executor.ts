@@ -37,8 +37,23 @@ export class ToolExecutor extends EventEmitter {
     this.concurrencyLimit = Math.max(1, concurrencyLimit);
   }
 
-  async executeBatch(actions: PlannedAction[]): Promise<ActionResult[]> {
+  async executeBatch(
+    actions: PlannedAction[],
+    options?: { signal?: AbortSignal; toolTimeoutMs?: number }
+  ): Promise<ActionResult[]> {
     if (actions.length === 0) return [];
+
+    const signal = options?.signal;
+    const toolTimeoutMs = options?.toolTimeoutMs;
+
+    const throwIfAborted = (): void => {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Task aborted");
+      }
+    };
+    throwIfAborted();
 
     // ① 串行确认副作用工具（提示逐个出现，顺序确定）
     const permits = await this.checkPermissions(actions);
@@ -78,16 +93,15 @@ export class ToolExecutor extends EventEmitter {
       (x) => !this.toolRegistry.isConcurrent(x.a.toolName)
     );
 
+    const wrap = async (x: { a: PlannedAction; i: number }): Promise<void> => {
+      throwIfAborted();
+      results[x.i] = await this.runOne(x.a, { signal, toolTimeoutMs });
+    };
+
     // 并发组限流执行（避免 FD/连接耗尽）；串行组顺序执行（副作用保守）
-    await this.runWithLimit(
-      concurrentOnes.map(
-        (x) => async () => {
-          results[x.i] = await this.runOne(x.a);
-        }
-      )
-    );
+    await this.runWithLimit(concurrentOnes.map((x) => () => wrap(x)));
     for (const x of serialOnes) {
-      results[x.i] = await this.runOne(x.a);
+      await wrap(x);
     }
 
     return results;
@@ -108,10 +122,55 @@ export class ToolExecutor extends EventEmitter {
     await Promise.all(workers);
   }
 
-  private async runOne(a: PlannedAction): Promise<ActionResult> {
+  private async runOne(
+    a: PlannedAction,
+    opts?: { signal?: AbortSignal; toolTimeoutMs?: number }
+  ): Promise<ActionResult> {
+    const signal = opts?.signal;
+    const toolTimeoutMs = opts?.toolTimeoutMs;
     this.emit("event", { type: "toolStart", action: a });
     try {
-      const result = await this.toolRegistry.execute(a.toolName, a.toolArgs);
+      let resultP: Promise<string> = this.toolRegistry.execute(a.toolName, a.toolArgs);
+
+      // 超时包装：仅当 toolTimeoutMs > 0 时生效
+      if (toolTimeoutMs && toolTimeoutMs > 0) {
+        resultP = Promise.race([
+          resultP,
+          new Promise<string>((_, rej) =>
+            setTimeout(
+              () => rej(new Error(`工具执行超时 (>${toolTimeoutMs}ms)`)),
+              toolTimeoutMs
+            )
+          ),
+        ]);
+      }
+
+      // 取消信号包装：signal 触发立即 reject
+      if (signal) {
+        resultP = Promise.race([
+          resultP,
+          new Promise<string>((_, rej) => {
+            const onAbort = () => {
+              rej(
+                signal!.reason instanceof Error
+                  ? (signal!.reason as Error)
+                  : new Error("Task aborted")
+              );
+            };
+            if (signal.aborted) {
+              onAbort();
+              return;
+            }
+            signal.addEventListener("abort", onAbort, { once: true });
+          }).finally(() => {
+            try {
+              signal.removeEventListener("abort", () => {});
+            } catch {}
+          }),
+        ]);
+      }
+
+      const result = await resultP;
       const r: ActionResult = {
         toolName: a.toolName,
         toolArgs: a.toolArgs,
@@ -125,7 +184,7 @@ export class ToolExecutor extends EventEmitter {
         toolName: a.toolName,
         toolArgs: a.toolArgs,
         success: false,
-        result: `[工具执行失败] ${err.message}`,
+        result: `[工具执行失败] ${err && err.message ? err.message : String(err)}`,
       };
       this.emit("event", { type: "toolEnd", result: r });
       return r;

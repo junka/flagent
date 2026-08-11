@@ -1293,6 +1293,476 @@ export function createPwnTools(): ToolRegistry {
     },
   });
 
+  // ========= 专业反汇编工具增强（优先调用系统专业工具，不存在时降级/提示） =========
+
+  registry.register({
+    name: "pwn_objdump",
+    description:
+      "GNU objdump 完整反汇编/符号/节数据。专业级：支持指定函数/地址范围反汇编；系统无 objdump 时给出降级提示。比自制 disassemble 准确得多。",
+    parameters: z.object({
+      path: z.string().describe("ELF/PE/Mach-O 二进制路径"),
+      mode: z
+        .enum(["disasm", "disasm-func", "disasm-range", "syms", "dyn-syms", "sections", "relocs", "headers"])
+        .default("disasm")
+        .describe(
+          "disasm=全反汇编(-d)/disasm-func=指定函数反汇编/disasm-range=地址范围/syms=符号表(-t)/dyn-syms=动态符号(-T)/sections=节信息(-h)/relocs=重定位(-R)/headers=全部头部(-x)"
+        ),
+      symbol: z.string().optional().describe("mode=disasm-func 时必填：函数名（如 main、win、vuln）"),
+      startAddr: z.string().optional().describe("mode=disasm-range 时：起始地址，如 0x401000"),
+      endAddr: z.string().optional().describe("mode=disasm-range 时：结束地址"),
+      intelSyntax: z.boolean().default(true).describe("x86 时是否使用 Intel 语法（默认 true）"),
+      maxLines: z.number().min(50).max(5000).default(1500).describe("输出超过此时在末尾截断，避免 LLM 上下文爆炸"),
+    }),
+    category: "pwn",
+    concurrent: true,
+    requirePermission: true,
+    execute: async (args: any) => {
+      const { path, mode, symbol, startAddr, endAddr, intelSyntax, maxLines } = args;
+      if (!fs.existsSync(path)) return `❌ 文件不存在: ${path}`;
+      const { spawnSync } = require("child_process") as typeof import("child_process");
+
+      // 检查 objdump 是否存在
+      const which = spawnSync("which", ["objdump"], { timeout: 3000, encoding: "utf-8" });
+      if (which.status !== 0 || !which.stdout.trim()) {
+        return (
+          `⚠️  系统未安装 objdump（属于 binutils 包）。\n` +
+          `  macOS: brew install binutils  （使用 gobjdump，若需手工替换）\n` +
+          `  Ubuntu/Debian: sudo apt install binutils\n` +
+          `  RHEL/CentOS: sudo yum install binutils\n` +
+          `  也可先使用 pwn_static_analysis(path) 工具获得基础信息。`
+        );
+      }
+
+      const args_: string[] = [];
+      switch (mode) {
+        case "disasm":
+          args_.push("-d");
+          if (intelSyntax) args_.push("-M", "intel");
+          break;
+        case "disasm-func":
+          if (!symbol) return `❌ mode=disasm-func 必须传 symbol 参数`;
+          args_.push(`--disassemble=${symbol}`);
+          if (intelSyntax) args_.push("-M", "intel");
+          break;
+        case "disasm-range": {
+          if (!startAddr) return `❌ mode=disasm-range 必须传 startAddr`;
+          args_.push("-d");
+          if (intelSyntax) args_.push("-M", "intel");
+          // objdump 没有原生范围参数，用 start-stop-addr 可选
+          args_.push(`--start-address=${startAddr}`);
+          if (endAddr) args_.push(`--stop-address=${endAddr}`);
+          break;
+        }
+        case "syms": args_.push("-t"); break;
+        case "dyn-syms": args_.push("-T"); break;
+        case "sections": args_.push("-h"); break;
+        case "relocs": args_.push("-R"); break;
+        case "headers": args_.push("-x"); break;
+      }
+      args_.push(path);
+
+      const r = spawnSync("objdump", args_, { timeout: 30000, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+      let stdout = r.stdout || "";
+      const stderr = r.stderr || "";
+
+      // 行数截断
+      const lines = stdout.split("\n");
+      let truncated = "";
+      if (lines.length > maxLines) {
+        truncated = `\n... (输出共 ${lines.length} 行，截断前 ${maxLines} 行；后续可改用 disasm-func 或 disasm-range 范围反汇编)`;
+        stdout = lines.slice(0, maxLines).join("\n");
+      }
+
+      const header =
+        `[pwn_objdump mode=${mode}${symbol ? " symbol=" + symbol : ""}${startAddr ? " range=" + startAddr + "~" + (endAddr || "?") : ""}]\n`;
+      const tail = stderr ? `\n[STDERR] ${stderr.slice(0, 400)}\n` : "";
+      if (r.status !== 0) {
+        return header + `❌ objdump 退出码 ${r.status}${tail}` + (stdout ? `\n${stdout.slice(0, 2000)}` : "");
+      }
+      return header + stdout + truncated + tail;
+    },
+  });
+
+  registry.register({
+    name: "pwn_checksec",
+    description:
+      "专业级 checksec：优先使用 pwntools 的 checksec --format=json 输出 RELRO/Stack Canary/NX/PIE/RPATH/RUNPATH/FORTIFY/fortify_source 全量保护；否则用 readelf 组合；比 binary_analysis 的粗略检测更准。",
+    parameters: z.object({
+      path: z.string().describe("ELF/二进制路径"),
+    }),
+    category: "pwn",
+    concurrent: true,
+    requirePermission: true,
+    execute: async (args: any) => {
+      const { path } = args;
+      if (!fs.existsSync(path)) return `❌ 文件不存在: ${path}`;
+      const { spawnSync } = require("child_process") as typeof import("child_process");
+      const out: string[] = [];
+
+      // 1) 优先 pwntools checksec（最专业）
+      const whichCS = spawnSync("which", ["checksec"], { timeout: 3000, encoding: "utf-8" });
+      if (whichCS.status === 0 && whichCS.stdout.trim()) {
+        const r = spawnSync("checksec", [`--file=${path}`, "--format=json"], {
+          timeout: 15000,
+          encoding: "utf-8",
+        });
+        if (r.status === 0 && r.stdout.trim()) {
+          out.push("✅ 使用 pwntools checksec:");
+          try {
+            const json = JSON.parse(r.stdout);
+            // json 结构: { "<path>": { "relro":"Full RELRO", ... } }
+            const key = Object.keys(json)[0] || path;
+            const v: Record<string, any> = json[key] || {};
+            for (const k of Object.keys(v)) {
+              out.push(`  ${String(k).padEnd(20)} : ${JSON.stringify(v[k])}`);
+            }
+          } catch {
+            out.push("  (JSON 解析失败，原始输出:)");
+            out.push(r.stdout.slice(0, 4000));
+          }
+          // 附人读版本：再跑一次无 format 的
+          const r2 = spawnSync("checksec", [`--file=${path}`], { timeout: 15000, encoding: "utf-8" });
+          if (r2.status === 0) out.push("\n人读输出:\n" + r2.stdout.trim());
+          return out.join("\n");
+        } else {
+          out.push(
+            `⚠️  checksec 调用失败 (exit=${r.status})，fallback 到 readelf。` +
+              `安装 pwntools 可得到更全的检测结果：pip install pwntools`
+          );
+        }
+      } else {
+        out.push(
+          "ℹ️  未检测到 pwntools 的 checksec。建议: pip install pwntools（会附带 checksec 命令）。Fallback 到 readelf 组合结果："
+        );
+      }
+
+      // 2) fallback：组合 readelf
+      const readelfL = spawnSync("readelf", ["-l", path], { timeout: 5000, encoding: "utf-8" });
+      const readelfD = spawnSync("readelf", ["-d", path], { timeout: 5000, encoding: "utf-8" });
+      const readelfS = spawnSync("readelf", ["-S", path], { timeout: 5000, encoding: "utf-8" });
+      const file = spawnSync("file", [path], { timeout: 5000, encoding: "utf-8" });
+      const symbols = spawnSync("readelf", ["--dyn-syms", "-W", path], { timeout: 5000, encoding: "utf-8" });
+
+      out.push("\n[Fallback readelf 检测]");
+      if (file.status === 0) out.push("file: " + file.stdout.trim().split("\n")[0]);
+
+      // NX（GNU_STACK RWE）
+      if (readelfL.status === 0) {
+        const m = readelfL.stdout.match(/GNU_STACK[^\n]*/);
+        if (m) {
+          const line = m[0];
+          out.push("NX/GNU_STACK: " + (line.includes("RW ") && !line.includes("E") ? "✅ NX 启用（栈不可执行）" : "⚠️  栈可能可执行（RWE）"));
+        }
+        // PIE / DYN
+        const pie = readelfL.stdout.match(/Type:\s*\w+/);
+        out.push(
+          "Type / PIE: " +
+            (pie ? pie[0] : "") +
+            (readelfL.stdout.includes("(DYN)")
+              ? " → DYN 类型 ≈ PIE 可能已启用"
+              : readelfL.stdout.includes("(EXEC)")
+              ? " → EXEC 类型 = 未启用 PIE"
+              : "")
+        );
+        // RELRO
+        const relro = readelfL.stdout.includes("GNU_RELRO");
+        const bindNow = (readelfD.stdout || "").includes("BIND_NOW");
+        out.push(
+          "RELRO: " +
+            (relro ? (bindNow ? "✅ Full RELRO" : "🟡 Partial RELRO") : "❌ No RELRO")
+        );
+      }
+      // Canary
+      if (symbols.status === 0) {
+        out.push(
+          "Stack Canary: " +
+            ((symbols.stdout || "").includes("__stack_chk_fail")
+              ? "✅ 检测到 __stack_chk_fail（Canary 启用）"
+              : "❌ 未检测到 Canary 符号")
+        );
+      }
+      // RPATH / RUNPATH
+      if (readelfD.status === 0) {
+        const rpath = (readelfD.stdout.match(/RPATH[^\n]*/) || [])[0];
+        const runpath = (readelfD.stdout.match(/RUNPATH[^\n]*/) || [])[0];
+        if (rpath) out.push("RPATH: " + rpath.trim());
+        if (runpath) out.push("RUNPATH: " + runpath.trim());
+        if (!rpath && !runpath) out.push("RPATH/RUNPATH: 未设置（安全）");
+        if (readelfD.stdout.includes("FORTIFY_SOURCE") || (readelfS.stdout || "").includes("_chk@"))
+          out.push("FORTIFY: 可能启用（检测到 _chk 系列符号）");
+      }
+
+      return out.join("\n");
+    },
+  });
+
+  registry.register({
+    name: "pwn_radare2",
+    description:
+      "专业反汇编软件 Radare2（r2）集成：aaa 完整分析后可反汇编函数、列符号字符串等。输出准确性比 objdump 高（识别 syscall/switch/PLT 跳转等）。系统无 r2 时给出安装命令。",
+    parameters: z.object({
+      path: z.string().describe("二进制路径"),
+      commands: z
+        .string()
+        .default("aaa; afl; pdf @ main")
+        .describe(
+          "r2 脚本命令，多个用 ; 分隔。常用：aaa=分析;afl=所有函数列表;pdf@main=反汇编 main;iz=字符串;ii=导入表;ie=入口;axf=xrefs;aha=函数直方图;agf=控制流图"
+        ),
+      maxLines: z.number().min(100).max(10000).default(3000).describe("输出行数限制"),
+    }),
+    category: "pwn",
+    concurrent: true,
+    requirePermission: true,
+    execute: async (args: any) => {
+      const { path, commands, maxLines } = args;
+      if (!fs.existsSync(path)) return `❌ 文件不存在: ${path}`;
+      const { spawnSync } = require("child_process") as typeof import("child_process");
+      const which = spawnSync("which", ["r2"], { timeout: 3000, encoding: "utf-8" });
+      if (which.status !== 0 || !which.stdout.trim()) {
+        return (
+          `⚠️  系统未安装 Radare2 (r2)。安装方式：\n` +
+          `  macOS: brew install radare2\n` +
+          `  Ubuntu: sudo apt install radare2  或  git+官方脚本（sys/install.sh）\n` +
+          `  Fedora: sudo dnf install radare2\n` +
+          `  也可先用 pwn_objdump(path, mode=\"disasm-func\", symbol=\"main\") 获得 objdump 基础反汇编。`
+        );
+      }
+
+      // radare2 脚本模式：r2 -q -c "cmd1;cmd2" path
+      const r = spawnSync("r2", ["-q", "-c", commands, path], {
+        timeout: 120000, // aaa 对大型二进制可能较久
+        encoding: "utf-8",
+        maxBuffer: 20 * 1024 * 1024,
+      });
+      let stdout = r.stdout || "";
+      const lines = stdout.split("\n");
+      let truncated = "";
+      if (lines.length > maxLines) {
+        truncated = `\n... (输出 ${lines.length} 行，仅展示前 ${maxLines} 行，请缩小 commands 范围)`;
+        stdout = lines.slice(0, maxLines).join("\n");
+      }
+      const head = `[pwn_radare2 commands=\"${commands}\"]\n`;
+      if (r.status !== 0) {
+        const err = r.stderr || "(无 stderr)";
+        return head + `❌ r2 异常退出 code=${r.status}\nSTDERR: ${err.slice(0, 1200)}\nSTDOUT:\n${stdout.slice(0, 2000)}`;
+      }
+      return head + stdout + truncated;
+    },
+  });
+
+  registry.register({
+    name: "pwn_rop_gadget",
+    description:
+      "搜索 ROP gadget：优先 ROPgadget 工具（pwntools 推荐）；其次 ropper；最后 objdump + grep 降级搜索 pop/ret/syscall 等。用于 ret2syscall/ret2csu/stack pivot 等构造。",
+    parameters: z.object({
+      path: z.string().describe("ELF 二进制 / libc.so.6"),
+      filter: z
+        .string()
+        .optional()
+        .describe(
+          "过滤条件：ROPgadget 时传 --only 'pop|ret' 等价；objdump 降级时作为 grep 关键词（如 'pop rdi ; ret'、'syscall'、'leave ; ret'）。留空返回常见 gadget 列表。"
+        ),
+      maxGadgets: z.number().min(50).max(5000).default(500),
+    }),
+    category: "pwn",
+    concurrent: true,
+    requirePermission: true,
+    execute: async (args: any) => {
+      const { path, filter, maxGadgets } = args;
+      if (!fs.existsSync(path)) return `❌ 文件不存在: ${path}`;
+      const { spawnSync } = require("child_process") as typeof import("child_process");
+      const out: string[] = [];
+
+      const whichRG = spawnSync("which", ["ROPgadget"], { timeout: 3000, encoding: "utf-8" });
+      if (whichRG.status === 0 && whichRG.stdout.trim()) {
+        const cmd: string[] = ["--binary", path];
+        if (filter) cmd.push("--only", filter);
+        const r = spawnSync("ROPgadget", cmd, {
+          timeout: 60000,
+          encoding: "utf-8",
+          maxBuffer: 20 * 1024 * 1024,
+        });
+        if (r.status === 0) {
+          const lines = r.stdout.split("\n");
+          const nonEmpty = lines.filter((l) => l.includes(" : ") || l.includes("0x"));
+          out.push(
+            `✅ ROPgadget 结果共 ${nonEmpty.length} 条（展示前 ${maxGadgets} 条）：`
+          );
+          for (const l of nonEmpty.slice(0, maxGadgets)) out.push("  " + l.trim());
+          if (nonEmpty.length > maxGadgets)
+            out.push(`  ...(${nonEmpty.length - maxGadgets} 条被截断，请传 filter 缩小范围)`);
+          return out.join("\n");
+        } else {
+          out.push(
+            `⚠️  ROPgadget 异常 code=${r.status}, stderr=${(r.stderr || "").slice(0, 400)}; fallback`
+          );
+        }
+      }
+
+      const whichRP = spawnSync("which", ["ropper"], { timeout: 3000, encoding: "utf-8" });
+      if (whichRP.status === 0 && whichRP.stdout.trim()) {
+        const cmd: string[] = ["--file", path, "--nocolor"];
+        if (filter) cmd.push("--filter", filter);
+        const r = spawnSync("ropper", cmd, {
+          timeout: 60000,
+          encoding: "utf-8",
+          maxBuffer: 20 * 1024 * 1024,
+        });
+        if (r.status === 0) {
+          const lines = (r.stdout || "").split("\n");
+          const nonEmpty = lines.filter((l) => /0x[0-9a-fA-F]+/.test(l));
+          out.push(`✅ ropper 结果共 ${nonEmpty.length} 条（前 ${maxGadgets}）:`);
+          for (const l of nonEmpty.slice(0, maxGadgets)) out.push("  " + l.trim());
+          return out.join("\n");
+        } else {
+          out.push(`⚠️  ropper 异常 code=${r.status}; fallback`);
+        }
+      }
+
+      // Fallback: objdump -d + grep 常用 gadget
+      out.push(
+        "ℹ️  ROPgadget/ropper 均未安装。建议: pip install ROPgadget ropper。Fallback 到 objdump -d + grep。"
+      );
+      const patterns = filter
+        ? [filter]
+        : [
+            "pop rdi ; ret",
+            "pop rsi ; pop r15 ; ret",
+            "pop rdx ; ret",
+            "pop rax ; ret",
+            "syscall",
+            "leave ; ret",
+            "pop rbp ; ret",
+            "ret",
+          ];
+      const od = spawnSync("objdump", ["-d", "-M", "intel", path], {
+        timeout: 30000,
+        encoding: "utf-8",
+        maxBuffer: 20 * 1024 * 1024,
+      });
+      if (od.status !== 0) {
+        return out.join("\n") + "\n❌ objdump fallback 也失败：" + (od.stderr || "").slice(0, 600);
+      }
+      const asm = od.stdout;
+      let totalShown = 0;
+      for (const p of patterns) {
+        // 找 asm 中 "addr:  bytes    instr1; instr2" 行与 instr 子串匹配
+        const regex = new RegExp(
+          "([0-9a-fA-F]+):\\s+[0-9a-fA-F ]+\\s+(.+\\b" +
+            p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").split(/\s*;\s*/).join(".*") +
+            "\\b.*)",
+          "g"
+        );
+        const matches: Array<[string, string]> = [];
+        let m: RegExpExecArray | null;
+        while ((m = regex.exec(asm)) != null) {
+          matches.push([m[1], m[2].trim()]);
+          if (matches.length >= 20) break;
+        }
+        if (matches.length > 0) {
+          out.push(`\n匹配 "${p}":`);
+          for (const [addr, instr] of matches) {
+            out.push(`  0x${addr}: ${instr}`);
+            totalShown++;
+            if (totalShown >= maxGadgets) break;
+          }
+        }
+        if (totalShown >= maxGadgets) break;
+      }
+      if (totalShown === 0) out.push("  (Fallback grep 没命中；建议安装 ROPgadget)");
+      return out.join("\n");
+    },
+  });
+
+  registry.register({
+    name: "pwn_nm",
+    description:
+      "nm/readelf --syms 提取完整符号表：所有函数地址、全局变量、导入符号、weak 符号。比 pwn_static_analysis 内置扫描更全，用于定位 win/vuln/system/puts@plt 等关键地址。",
+    parameters: z.object({
+      path: z.string().describe("二进制路径"),
+      scope: z
+        .enum(["all", "defined-only", "undefined-only", "functions-only", "objects-only"])
+        .default("all")
+        .describe(
+          "范围：all=全部 / defined-only=已定义 / undefined-only=未定义（导入） / functions-only=仅函数 / objects-only=仅变量"
+        ),
+      demangle: z.boolean().default(true).describe("是否 C++ demangle（默认 true）"),
+      grep: z.string().optional().describe("关键词大小写不敏感过滤，如 'win|system|plt'"),
+      maxLines: z.number().min(50).max(5000).default(1500),
+    }),
+    category: "pwn",
+    concurrent: true,
+    requirePermission: true,
+    execute: async (args: any) => {
+      const { path, scope, demangle, grep, maxLines } = args;
+      if (!fs.existsSync(path)) return `❌ 文件不存在: ${path}`;
+      const { spawnSync } = require("child_process") as typeof import("child_process");
+
+      // 优先 nm -C（全符号，含本地）；否则 readelf --syms
+      const which = spawnSync("which", ["nm"], { timeout: 3000, encoding: "utf-8" });
+      const header = `[pwn_nm scope=${scope}]`;
+      let raw: string = "";
+      let stderr: string = "";
+      let source: "nm" | "readelf" = "nm";
+
+      if (which.status === 0 && which.stdout.trim()) {
+        const nmArgs: string[] = [];
+        if (demangle) nmArgs.push("-C");
+        if (scope === "defined-only") nmArgs.push("--defined-only");
+        if (scope === "undefined-only") nmArgs.push("--undefined-only");
+        nmArgs.push(path);
+        const r = spawnSync("nm", nmArgs, { timeout: 15000, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+        raw = r.stdout || "";
+        stderr = r.stderr || "";
+        if (r.status !== 0) {
+          source = "readelf";
+        }
+      } else {
+        source = "readelf";
+      }
+      if (source === "readelf") {
+        const r = spawnSync("readelf", ["-s", "-W", path], {
+          timeout: 15000,
+          encoding: "utf-8",
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        raw = r.stdout || "";
+        stderr += (r.stderr || "");
+      }
+
+      // 作用域后置过滤（nm 不支持 functions-only）
+      let lines = raw.split("\n");
+      if (scope === "functions-only") {
+        lines = lines.filter((l) => /^\s*[0-9a-fA-F]+\s+[TtWw]\s+/.test(l));
+      } else if (scope === "objects-only") {
+        lines = lines.filter((l) => /^\s*[0-9a-fA-F]+\s+[BbDdRrVvNn?SsCc]\s+/.test(l));
+      }
+      if (grep) {
+        try {
+          const re = new RegExp(grep, "i");
+          lines = lines.filter((l) => re.test(l));
+        } catch {
+          lines = lines.filter((l) => l.toLowerCase().includes(grep.toLowerCase()));
+        }
+      }
+
+      let truncated = "";
+      if (lines.length > maxLines) {
+        truncated = `\n... 共 ${lines.length} 行，截断前 ${maxLines}。可缩小 scope / 加 grep="win|main|system@plt" 过滤。`;
+        lines = lines.slice(0, maxLines);
+      }
+
+      return (
+        header +
+        ` (source=${source})` +
+        "\n" +
+        lines.join("\n") +
+        truncated +
+        (stderr ? `\n[STDERR] ${stderr.slice(0, 500)}` : "")
+      );
+    },
+  });
+
   return registry;
 }
 

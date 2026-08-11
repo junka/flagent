@@ -7,6 +7,10 @@ import { createAgentSystem, type AgentSystem } from "../agents/factory";
 import { createToolRegistry } from "../tools/factory";
 import { SessionManager } from "../session/session-manager";
 import type { AgentEvent } from "../agents/agent-events";
+import {
+  getBackgroundManager,
+  type BackgroundTaskSnapshot,
+} from "../agents/background-manager";
 
 // 兼容旧 import 路径（tests 仍从 dist/cli/index 取 createAgentSystem / createToolRegistry）
 export { createAgentSystem, createToolRegistry, type AgentSystem };
@@ -140,9 +144,15 @@ export function classifyLLMError(error: any): LLMErrorDiagnosis {
 /** 启动 BANNER：动态读 getLLMConfig()，反映 platform/model/workspace/key 当前态。 */
 function renderBanner(): string {
   const cfg = getLLMConfig();
-  const platformLabel = cfg.platform === "qianwen" ? "千问平台" : "百炼平台";
+  let platformLabel: string = cfg.platform;
+  switch (cfg.platform) {
+    case "qianwen": platformLabel = "千问平台 (DashScope)"; break;
+    case "bailian": platformLabel = "百炼平台 (Bailian Workspace)"; break;
+    case "anthropic": platformLabel = "Anthropic API"; break;
+  }
   const ws =
-    cfg.platform === "bailian" && cfg.workspaceId ? cfg.workspaceId : "(无)";
+    cfg.platform === "bailian" && cfg.workspaceId ? cfg.workspaceId :
+    cfg.platform === "anthropic" ? "(不适用)" : "(无)";
   return `
 ╔══════════════════════════════════════════════════════════════╗
 ║                    Flagent Multi-Agent System                ║
@@ -163,8 +173,14 @@ const HELP_TEXT = `
   /delete <id>       删除指定会话（内存 + 磁盘）
   /title [标题]      查看或设置当前会话标题
 
+后台任务（长时间分析在后台跑，前台可继续工作/定时轮询）:
+  /bgstart <任务>    后台启动任务（立即返回 taskId，不阻塞前台），事件仍实时打印
+  /bg                列出所有后台任务及其状态（PENDING/RUNNING/STUCK/...）
+  /status [id]       查看单个任务详细健康状态（步数/最近活动/空闲时长）
+  /kill <id>         取消指定后台任务（AbortSignal 下发到 LLM + 工具）
+
 LLM 配置（全局，写入 ~/.flagent/config.json，重启后生效）:
-  /platform [平台]   切换平台（qianwen 千问 / bailian 百炼）；无参显示当前
+  /platform [平台]   切换平台（qianwen 千问 / bailian 百炼 / anthropic）；无参显示当前
   /model [名称]      列出可用模型或切换模型（/model <name>）；切换写回全局配置
 
 会话内命令:
@@ -183,6 +199,7 @@ LLM 配置（全局，写入 ~/.flagent/config.json，重启后生效）:
   - 无活动会话时首次提问会自动新建会话
   - 会话自动持久化到 .flagent/sessions/，重启后可 /switch 恢复
   - 思考过程实时流式输出；多步骤 Plan 会暂停等待确认，单步骤直接执行
+  - 后台任务每 30s 自动打印健康摘要；长时间无活动会被标记 WARNING 或 STUCK，可 /kill 取消
 `;
 
 function fmtTime(ts: number): string {
@@ -208,6 +225,82 @@ function indent(text: string, prefix: string): string {
 function preview(text: string, max = 100): string {
   const oneLine = text.replace(/\n/g, " ").trim();
   return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
+}
+
+/** 把毫秒转成人读的时长。 */
+function fmtDuration(ms: number | null): string {
+  if (ms == null || !isFinite(ms) || ms < 0) return "-";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return `${m}m${rs}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}h${rm}m`;
+}
+
+/** 后台任务单行摘要（供 /bg 与 30s 健康摘要复用）。 */
+function formatTaskSummary(
+  t: BackgroundTaskSnapshot & { health?: "HEALTHY" | "WARNING" | "STUCK" | "IDLE" }
+): string {
+  const stepStr =
+    t.currentStep != null
+      ? `Step ${t.currentStep}${t.maxSteps ? `/${t.maxSteps}` : ""}`
+      : "未启动";
+  const healthBadge =
+    t.health === "STUCK" ? " 🔴STUCK" :
+    t.health === "WARNING" ? " 🟡WARNING" :
+    t.health === "HEALTHY" ? " 🟢" :
+    "";
+  const statusBadge =
+    t.status === "RUNNING" ? "🏃RUNNING" :
+    t.status === "COMPLETED" ? "✅COMPLETED" :
+    t.status === "CRASHED" ? "💥CRASHED" :
+    t.status === "CANCELLED" ? "🛑CANCELLED" :
+    t.status === "STUCK" ? "🔴STUCK" :
+    t.status === "PENDING" ? "⏳PENDING" :
+    t.status;
+  const tail =
+    t.status === "COMPLETED"
+      ? ` | 结果: ${t.result?.success ? "成功" : "未完成"}`
+      : t.status === "CRASHED" && t.error
+      ? ` | 错误: ${t.error.slice(0, 60)}`
+      : t.idleMs != null
+      ? ` | 空闲: ${fmtDuration(t.idleMs)}`
+      : "";
+  return (
+    `  • ${t.taskId.slice(0, 10).padEnd(12)} ${statusBadge.padEnd(13)}` +
+    ` ${stepStr.padEnd(12)}` +
+    `${healthBadge}  ${shortTitle(t.title).padEnd(28)}` +
+    tail
+  );
+}
+
+/** 单个任务的详细健康信息打印。 */
+function printTaskDetail(
+  t: BackgroundTaskSnapshot & { health?: "HEALTHY" | "WARNING" | "STUCK" | "IDLE" }
+): void {
+  console.log(`\n  任务 ${t.taskId}`);
+  console.log(`    会话:       ${t.sessionId.slice(0, 12)}`);
+  console.log(`    标题:       ${t.title || "(未命名)"}`);
+  console.log(`    状态:       ${t.status}` +
+    (t.health ? ` (健康=${t.health})` : ""));
+  console.log(`    创建时间:   ${fmtTime(t.createdAt)}`);
+  console.log(`    启动时间:   ${t.startedAt ? fmtTime(t.startedAt) : "(未启动)"}`);
+  console.log(`    结束时间:   ${t.endedAt ? fmtTime(t.endedAt) : "-"}`);
+  console.log(`    最近活动:   ${t.lastActivityAt ? fmtTime(t.lastActivityAt) + " (" + fmtDuration(t.idleMs) + "前)" : "-"}`);
+  console.log(`    当前步数:   ${t.currentStep != null ? t.currentStep + (t.maxSteps ? ` / ${t.maxSteps}` : "") : "(未启动)"}`);
+  console.log(`    任务预览:   ${t.taskPreview}`);
+  if (t.status === "COMPLETED") {
+    console.log(`    完成: success=${t.result?.success}, tokens=${t.result?.totalTokens ?? "-"}`);
+    if (t.result?.finalAnswer) {
+      console.log(`    FinalAnswer 首行: ${t.result.finalAnswer.split("\n")[0].slice(0, 160)}`);
+    }
+  }
+  if (t.status === "CRASHED") {
+    console.log(`    崩溃错误: ${t.error}`);
+  }
 }
 
 export async function startCLI(): Promise<void> {
@@ -263,6 +356,50 @@ export async function startCLI(): Promise<void> {
   }
 
   console.log("系统已启动！输入 /help 查看帮助，直接输入问题开始对话。\n");
+
+  // --- 30 秒一次后台任务健康自动轮询 ---
+  // 仅在有 RUNNING / STUCK / WARNING 的任务时才打印，避免刷屏。
+  const HEALTH_INTERVAL_MS = 30 * 1000;
+  let lastSeenFinalStates = new Set<string>(); // 已经通知过的 COMPLETED/CRASHED/CANCELLED 任务（避免反复刷）
+  const healthTimer = setInterval(() => {
+    try {
+      const reports = getBackgroundManager().healthCheck();
+      const active = reports.filter(
+        (t) => t.status === "RUNNING" || t.status === "STUCK"
+      );
+      const newlyFinal = reports.filter(
+        (t) =>
+          (t.status === "COMPLETED" || t.status === "CRASHED" || t.status === "CANCELLED") &&
+          !lastSeenFinalStates.has(t.taskId)
+      );
+      for (const t of newlyFinal) lastSeenFinalStates.add(t.taskId);
+      if (active.length === 0 && newlyFinal.length === 0) return;
+
+      const lines: string[] = [];
+      lines.push("\n" + "─".repeat(60));
+      lines.push(`⏰ 后台健康摘要 (${new Date().toLocaleTimeString()})`);
+      if (active.length > 0) {
+        lines.push("  活跃任务:");
+        for (const t of active) lines.push(formatTaskSummary(t));
+      }
+      if (newlyFinal.length > 0) {
+        lines.push("  刚刚结束的任务:");
+        for (const t of newlyFinal) lines.push(formatTaskSummary(t));
+      }
+      lines.push("─".repeat(60));
+      console.log(lines.join("\n"));
+      // 重新显示提示行（prompt 已被打断）
+      try { rl.prompt(); } catch {}
+    } catch (e: any) {
+      // 健康检查自身异常不能把 CLI 崩了
+      try { console.warn("[健康检查异常]", e && e.message ? e.message : e); } catch {}
+    }
+  }, HEALTH_INTERVAL_MS);
+  healthTimer.unref(); // 不阻塞进程退出
+
+  // 结束时清理已结束 >1h 的任务（不阻塞启动）
+  try { getBackgroundManager().cleanup(60 * 60 * 1000); } catch {}
+
   refreshPrompt();
   rl.prompt();
 
@@ -300,29 +437,44 @@ export async function startCLI(): Promise<void> {
       return;
     }
 
-    // /platform [qianwen|bailian] —— 切换平台，写回全局配置
+    // /platform [qianwen|bailian|anthropic] —— 切换平台，写回全局配置
     if (input === "/platform" || input.startsWith("/platform ")) {
       const arg = input.slice(9).trim().toLowerCase();
       if (!arg) {
         const cfg = getLLMConfig();
-        console.log(`\n🖥️  当前平台: ${cfg.platform === "qianwen" ? "千问" : "百炼"}`);
+        let label: string = cfg.platform;
+        switch (cfg.platform) {
+          case "qianwen": label = "千问 (DashScope)"; break;
+          case "bailian": label = "百炼 (Workspace)"; break;
+          case "anthropic": label = "Anthropic (OpenAI 兼容)"; break;
+        }
+        console.log(`\n🖥️  当前平台: ${label}`);
         console.log(`  baseUrl: ${cfg.baseUrl}`);
-        console.log(`  切换: /platform qianwen  或  /platform bailian`);
+        console.log(`  切换: /platform qianwen  或  /platform bailian  或  /platform anthropic`);
         console.log(
           `  - 千问: https://dashscope.aliyuncs.com/compatible-mode/v1（无需 workspaceId）`
         );
         console.log(
           `  - 百炼: https://{workspaceId}.cn-beijing.maas.aliyuncs.com/...（需 workspaceId）`
         );
-      } else if (arg === "qianwen" || arg === "bailian") {
+        console.log(
+          `  - Anthropic: https://api.anthropic.com/v1（支持 claude-* 系列，ANTHROPIC_API_KEY 优先识别）`
+        );
+      } else if (arg === "qianwen" || arg === "bailian" || arg === "anthropic") {
         setLLMConfig({ platform: arg as Platform });
         writeGlobalConfig({ platform: arg as Platform });
         const cfg = getLLMConfig();
-        console.log(`\n🖥️  平台已切换: ${arg === "qianwen" ? "千问" : "百炼"}`);
+        let label = arg;
+        switch (arg) {
+          case "qianwen": label = "千问"; break;
+          case "bailian": label = "百炼"; break;
+          case "anthropic": label = "Anthropic"; break;
+        }
+        console.log(`\n🖥️  平台已切换: ${label}  →  默认模型: ${cfg.modelName}`);
         console.log(`  baseUrl: ${cfg.baseUrl}`);
         console.log(`  已写入全局配置 (~/.flagent/config.json)，重启后生效`);
       } else {
-        console.log(`\n⚠️  用法: /platform [qianwen|bailian]`);
+        console.log(`\n⚠️  用法: /platform [qianwen|bailian|anthropic]`);
       }
       rl.prompt();
       return;
@@ -469,6 +621,201 @@ export async function startCLI(): Promise<void> {
         await sessionManager.persistActive();
         console.log(`\n🏷️  标题已更新: ${title}`);
         refreshPrompt();
+      }
+      rl.prompt();
+      return;
+    }
+
+    // /bgstart <任务> —— 后台启动，立即返回 taskId（不阻塞前台）
+    if (input.startsWith("/bgstart ")) {
+      const task = input.slice(8).trim();
+      if (!task) {
+        console.log("\n⚠️  用法: /bgstart <任务描述>");
+        rl.prompt();
+        return;
+      }
+      // 后台任务期间仍拦截前台 run 触发，但允许继续输入命令（mainAgentRunning 只卡普通任务）
+      if (!sessionManager.current()) await sessionManager.create();
+      const session = sessionManager.current()!;
+      const taskBadge = " [BG]";
+
+      /** 后台事件打印：复用 verbose 策略（与前台相同的视觉）。 */
+      const onEvent = (event: AgentEvent): void => {
+        switch (event.type) {
+          case "stepStart":
+            if (verbose)
+              console.log(`\n${taskBadge} ━━━ Step ${event.step}/${event.maxSteps} ━━━`);
+            break;
+          case "thought": {
+            if (verbose) {
+              console.log(`\n${taskBadge} 💭 思考:`);
+              console.log(indent(event.thought, "        "));
+            } else {
+              const head = event.thought.split("\n")[0];
+              console.log(`\n${taskBadge} 💭 ${preview(head, 80)}`);
+            }
+            break;
+          }
+          case "plan": {
+            const tag = event.isMultiStep ? "（多步骤·待确认）" : "（单步骤·直接执行）";
+            console.log(`\n${taskBadge} 📋 Plan${tag}:`);
+            console.log(indent(event.plan, "       "));
+            break;
+          }
+          case "planConfirmed":
+            console.log(
+              taskBadge + (event.confirmed ? " ▶️  已确认，开始执行" : " ⏹️  已取消该计划")
+            );
+            break;
+          case "actionStart":
+            console.log(
+              `${taskBadge} 🔧 执行工具: ${event.actions
+                .map((a) => a.toolName).join(", ")}`
+            );
+            break;
+          case "toolStart":
+            if (verbose)
+              console.log(
+                `${taskBadge}    → 开始 ${event.action.toolName}(${JSON.stringify(
+                  event.action.toolArgs
+                )})`
+              );
+            break;
+          case "toolEnd": {
+            const r = event.result;
+            const mark = r.success ? "✓" : "✗";
+            const skipped = r.skipped ? "（跳过）" : "";
+            console.log(`${taskBadge}    ${mark} ${r.toolName}${skipped}:`);
+            console.log(indent(r.result, "           "));
+            break;
+          }
+          case "delegateStart":
+            console.log(`${taskBadge} 🤝 委派子智能体: ${event.agents.join(", ")}`);
+            break;
+          case "delegateEnd":
+            for (const d of event.results) {
+              const mark = d.success ? "✓" : "✗";
+              console.log(`${taskBadge}    ${mark} ${d.agentId}:`);
+              console.log(indent(d.result, "           "));
+            }
+            break;
+          case "spawnAgent": {
+            const mark = event.success ? "✓" : "✗";
+            const detail = event.success
+              ? `role=${event.config.role}, tools=${event.config.toolNames.join(", ")}`
+              : event.message || "注册失败";
+            console.log(`${taskBadge}    ${mark} SPAWN ${event.config.id}: ${detail}`);
+            break;
+          }
+          case "finalAnswer":
+            console.log(`\n${taskBadge} ${"─".repeat(52)}`);
+            console.log(`${taskBadge} ✅ 最终回答：`);
+            console.log(taskBadge + " " + "─".repeat(52));
+            console.log(indent(event.answer, taskBadge + "    "));
+            console.log(taskBadge + " " + "─".repeat(52));
+            break;
+          case "complete": {
+            console.log(`\n${taskBadge} 📈 执行统计：`);
+            console.log(`${taskBadge}    耗时: ${(event.duration / 1000).toFixed(1)}s`);
+            console.log(`${taskBadge}    Token 数: ${event.totalTokens}`);
+            console.log(
+              `${taskBadge}    状态: ${event.success ? "✓ 成功" : "✗ 未完成"}\n`
+            );
+            break;
+          }
+        }
+      };
+      const confirmPlan = (_plan: string): Promise<boolean> => {
+        return new Promise((resolve) => {
+          rl.question(`\n${taskBadge} ⏸️  多步骤 Plan，是否执行? (y/n) `, (answer) => {
+            resolve(answer.trim().toLowerCase().startsWith("y"));
+          });
+        });
+      };
+
+      try {
+        const taskId = session.runBackground(task, { onEvent, confirmPlan });
+        console.log(`\n🚀 任务已后台启动: ${taskId}（用 /bg 查看列表，/kill ${taskId.slice(0,8)} 取消）`);
+        refreshPrompt();
+      } catch (err: any) {
+        console.error(`\n❌ 启动后台任务失败: ${err.message}`);
+      }
+      rl.prompt();
+      return;
+    }
+
+    // /bg —— 列出后台任务（全会话全局），附带健康检查
+    if (input === "/bg") {
+      const reports = getBackgroundManager().healthCheck();
+      if (reports.length === 0) {
+        console.log("\n📭 暂无后台任务。用 /bgstart <任务> 启动一个。");
+      } else {
+        console.log("\n📋 后台任务列表（附健康诊断）：");
+        for (const r of reports) console.log(formatTaskSummary(r));
+        console.log(`\n  详细信息: /status <taskId>；取消: /kill <taskId>`);
+      }
+      rl.prompt();
+      return;
+    }
+
+    // /status [id] —— 查看任务详细健康信息
+    if (input === "/status" || input.startsWith("/status ")) {
+      const arg = input.slice(7).trim();
+      const mgr = getBackgroundManager();
+      const all = mgr.list();
+      const pick = (id: string) =>
+        all.find((t) => t.taskId === id || t.taskId.startsWith(id));
+      if (!arg) {
+        // 无参：打印最近 RUNNING / STUCK 的第一个详细信息；若没有就同 /bg
+        const active = mgr.healthCheck().filter(
+          (t) => t.status === "RUNNING" || t.status === "STUCK"
+        );
+        if (active.length === 0) {
+          console.log("\n(无活动后台任务，列表概览:)");
+          if (all.length === 0) {
+            console.log("  (空)");
+          } else {
+            for (const r of mgr.healthCheck()) console.log(formatTaskSummary(r));
+          }
+        } else {
+          console.log("\n📊 当前最活跃的后台任务：");
+          for (const t of active.slice(0, 3)) {
+            printTaskDetail(t);
+          }
+        }
+      } else {
+        const found = pick(arg);
+        if (!found) {
+          console.log(`\n⚠️  未找到任务: ${arg}`);
+        } else {
+          const health = mgr.healthCheck().find((t) => t.taskId === found.taskId);
+          printTaskDetail(health ?? found);
+        }
+      }
+      rl.prompt();
+      return;
+    }
+
+    // /kill <id> —— 取消任务
+    if (input.startsWith("/kill ")) {
+      const arg = input.slice(5).trim();
+      if (!arg) {
+        console.log("\n⚠️  用法: /kill <taskId>");
+      } else {
+        const all = getBackgroundManager().list();
+        const found = all.find(
+          (t) => t.taskId === arg || t.taskId.startsWith(arg)
+        );
+        if (!found) {
+          console.log(`\n⚠️  未找到任务: ${arg}`);
+        } else {
+          const ok = getBackgroundManager().cancel(found.taskId);
+          console.log(
+            ok
+              ? `\n🛑 已取消任务: ${found.taskId.slice(0, 10)} (${shortTitle(found.title)})`
+              : `\n⚠️  任务已结束，无法取消: ${found.status}`
+          );
+        }
       }
       rl.prompt();
       return;

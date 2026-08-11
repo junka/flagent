@@ -13,6 +13,12 @@ import type {
   AgentEvent,
   ConfirmPlanFn,
 } from "../agents/agent-events";
+import {
+  getBackgroundManager,
+  type BackgroundOptions,
+  type BackgroundTaskSnapshot,
+} from "../agents/background-manager";
+export type { BackgroundOptions, BackgroundTaskSnapshot };
 
 /** 运行选项：流式事件回调与 Plan 门控确认回调，全部可选（旧调用零改动）。 */
 export interface RunOptions {
@@ -148,6 +154,83 @@ export class Session {
       if (toolHandler && toolExecutor) toolExecutor.off("event", toolHandler);
       if (options?.confirmPlan) this.mainAgent.setConfirmPlanFn(undefined);
     }
+  }
+
+  /**
+   * 后台执行任务，立即返回 taskId。任务在 Promise 中推进，可通过
+   * getBackgroundStatus / cli 的 /bg /status 查看进度，/kill 取消。
+   * 完成/崩溃/取消都会更新任务状态，结果存 BackgroundManager 供轮询。
+   */
+  runBackground(task: string, options?: RunOptions & BackgroundOptions): string {
+    const mgr = getBackgroundManager();
+    const {
+      taskId,
+      signal,
+      heartbeat,
+      onEvent,
+      toolTimeoutMs,
+      bindPromise,
+      markStart,
+      markStep,
+      markComplete,
+      markCrash,
+    } = mgr.createTask({
+      sessionId: this.id,
+      title: this.title || this.deriveTitle(task),
+      task,
+      options,
+    });
+
+    // 异步启动：不 await，调用方拿到 taskId 就离开
+    const promise = (async (): Promise<AgentResult> => {
+      // 桥接事件：监听 mainAgent + toolExecutor 的 "event" 通道
+      const onEventLocal = options?.onEvent;
+      const toolExecutor = this.mainAgent.getToolExecutor();
+      let mainHandler: ((e: AgentEvent) => void) | undefined;
+      let toolHandler: ((e: AgentEvent) => void) | undefined;
+      const localEmit = (e: AgentEvent): void => {
+        onEvent(e); // Background 先记心跳
+        try { onEventLocal?.(e); } catch {}
+        if (e.type === "stepStart") markStep(e.step, e.maxSteps);
+      };
+      mainHandler = (e: AgentEvent) => localEmit(e);
+      this.mainAgent.on("event", mainHandler);
+      if (toolExecutor) {
+        toolHandler = (e: AgentEvent) => localEmit(e);
+        toolExecutor.on("event", toolHandler);
+      }
+      try {
+        // Plan 门控回调注入
+        if (options?.confirmPlan) this.mainAgent.setConfirmPlanFn(options.confirmPlan);
+        this.mainAgent.setHeartbeatCallback(heartbeat);
+
+        if (!this.title) this.title = this.deriveTitle(task);
+        markStart();
+
+        const result = await this.mainAgent.run(task, { signal, toolTimeoutMs });
+        // MainAgent.run 每次重置自身 steps；Session 是跨 run 历史真相源，累积保留
+        this.steps = [...this.steps, ...result.steps];
+        this.updatedAt = Date.now();
+        markComplete(result);
+        return result;
+      } catch (err: any) {
+        const eObj = err instanceof Error ? err : new Error(String(err));
+        markCrash(eObj);
+        throw eObj;
+      } finally {
+        if (mainHandler) this.mainAgent.off("event", mainHandler);
+        if (toolHandler && toolExecutor) toolExecutor.off("event", toolHandler);
+        if (options?.confirmPlan) this.mainAgent.setConfirmPlanFn(undefined);
+        this.mainAgent.setHeartbeatCallback(undefined);
+      }
+    })();
+    bindPromise(promise);
+    return taskId;
+  }
+
+  /** 查询指定后台任务状态（本会话的）；若 taskId 属于别的会话也能拿到（通用视图）。 */
+  getBackgroundStatus(taskId: string): BackgroundTaskSnapshot | null {
+    return getBackgroundManager().getStatus(taskId);
   }
 
   /** 序列化为可持久化结构（messages 去 timestamp/tokenCount）。 */

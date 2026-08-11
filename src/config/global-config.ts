@@ -13,7 +13,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 
-export type Platform = "qianwen" | "bailian";
+export type Platform = "qianwen" | "bailian" | "anthropic";
 
 export interface GlobalConfig {
   platform: Platform;

@@ -53,9 +53,17 @@ export class MainAgent extends EventEmitter {
     this.maxSteps = maxSteps;
   }
 
+  private heartbeatCallback?: () => void;
+
   /** 统一事件发射 helper。 */
   private emitEvent(event: AgentEvent): void {
+    try { this.heartbeatCallback?.(); } catch {}
     this.emit("event", event);
+  }
+
+  /** 设置后台任务心跳回调（background 运行时由 Session 注入）。传 undefined 清除。 */
+  setHeartbeatCallback(fn?: () => void): void {
+    this.heartbeatCallback = fn;
   }
 
   /** 设置 Plan 确认回调（多步骤 Plan 执行前询问用户）。传 undefined 清除。 */
@@ -82,9 +90,23 @@ export class MainAgent extends EventEmitter {
     this.steps = [...steps];
   }
 
-  async run(userTask: string): Promise<AgentResult> {
+  /** 运行选项：后台执行时注入的取消信号与工具级超时。 */
+  async run(
+    userTask: string,
+    options?: { signal?: AbortSignal; toolTimeoutMs?: number }
+  ): Promise<AgentResult> {
     const startTime = Date.now();
+    const signal = options?.signal;
+    const toolTimeoutMs = options?.toolTimeoutMs;
     this.steps = [];
+
+    const throwIfAborted = (): void => {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Task aborted");
+      }
+    };
 
     await this.contextManager.addMessage({
       role: "user",
@@ -92,8 +114,9 @@ export class MainAgent extends EventEmitter {
     });
 
     for (let step = 1; step <= this.maxSteps; step++) {
+      throwIfAborted();
       this.emitEvent({ type: "stepStart", step, maxSteps: this.maxSteps });
-      const stepResult = await this.reactStep(step, userTask);
+      const stepResult = await this.reactStep(step, userTask, { signal, toolTimeoutMs });
       this.emitEvent({ type: "stepEnd", step });
 
       if (stepResult.isComplete) {
@@ -174,12 +197,23 @@ export class MainAgent extends EventEmitter {
 
   private async reactStep(
     step: number,
-    userTask: string
+    userTask: string,
+    opts?: { signal?: AbortSignal; toolTimeoutMs?: number }
   ): Promise<{
     isComplete: boolean;
     needsMoreInfo: boolean;
     answer: string;
   }> {
+    const signal = opts?.signal;
+    const toolTimeoutMs = opts?.toolTimeoutMs;
+    const throwIfAborted = (): void => {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Task aborted");
+      }
+    };
+    throwIfAborted();
     const messages = this.contextManager.getActiveMessages();
     const historyText = messages
       .map((m) => `${m.role}: ${m.content}`)
@@ -249,7 +283,9 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
     const { text } = await generateText({
       model,
       prompt,
+      ...(signal ? { abortSignal: signal } : {}),
     });
+    throwIfAborted();
 
     const { thought, plan, actions, delegates, spawnAgents, finalAnswer } =
       parseMainReactResponse(text);
@@ -406,8 +442,8 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
 
     const actionTask: Promise<ActionResult[]> = hasActions
       ? this.toolExecutor
-        ? this.toolExecutor.executeBatch(actions)
-        : this.fallbackExecuteBatch(actions)
+        ? this.toolExecutor.executeBatch(actions, { signal, toolTimeoutMs })
+        : this.fallbackExecuteBatch(actions, { signal })
       : Promise.resolve<ActionResult[]>([]);
     const delegateTask: Promise<DispatchResult[]> = hasDelegates
       ? this.scheduler.dispatchConcurrent(
@@ -418,10 +454,36 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
         )
       : Promise.resolve<DispatchResult[]>([]);
 
+    // 包装取消：signal 触发时立即 reject，避免 Promise.all 永久挂住
+    const withCancel = async <T>(p: Promise<T>): Promise<T> => {
+      if (!signal) return p;
+      if (signal.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Task aborted");
+      }
+      let rejectOnAbort: (e: Error) => void = () => {};
+      const abortP = new Promise<never>((_, rej) => {
+        rejectOnAbort = (e) => rej(e);
+      });
+      const onAbort = () => {
+        rejectOnAbort(
+          signal!.reason instanceof Error
+            ? (signal!.reason as Error)
+            : new Error("Task aborted")
+        );
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        return await Promise.race([p, abortP]);
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    };
+
     const [actionResults, delegateResults] = await Promise.all([
-      actionTask,
-      delegateTask,
+      withCancel(actionTask),
+      withCancel(delegateTask),
     ]);
+    throwIfAborted();
 
     if (hasActions)
       this.emitEvent({ type: "actionEnd", step, results: actionResults });
@@ -464,10 +526,15 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
 
   /** toolExecutor 缺失时的回退执行（串行） */
   private async fallbackExecuteBatch(
-    actions: PlannedAction[]
+    actions: PlannedAction[],
+    opts?: { signal?: AbortSignal }
   ): Promise<ActionResult[]> {
+    const signal = opts?.signal;
     const results: ActionResult[] = [];
     for (const a of actions) {
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Task aborted");
+      }
       try {
         const result = await this.toolRegistry.execute(a.toolName, a.toolArgs);
         results.push({

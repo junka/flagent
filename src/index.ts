@@ -49,3 +49,10 @@ export {
   type MessageRole,
 } from "./session";
 export { model, API_KEY, MODEL_NAME, WORKSPACE_ID, BASE_URL, PLATFORM, getLLMConfig, setLLMConfig, listAvailableModels, classifyModel, type LLMConfig, type Platform, type ModelInfo } from "./llm/client";
+export {
+  BackgroundManager,
+  getBackgroundManager,
+  type BackgroundTaskStatus,
+  type BackgroundTaskSnapshot,
+  type BackgroundOptions,
+} from "./agents/background-manager";
