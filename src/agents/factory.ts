@@ -70,6 +70,21 @@ export function createAgentSystem(
         "ssrf_test", "ssti_test", "deserialization_test", "file_upload_test",
         "header_analysis",
       ],
+      crossCategoryToolNames: [
+        // Web 高级
+        "waf_cdn_detect", "cors_audit", "jwt_attack", "csrf_audit",
+        "xxe_test", "graphql_attack", "csp_audit", "saml_oauth_audit",
+        "websocket_audit", "auth_bypass", "race_condition",
+        // 数据库联动
+        "db_connect_brute", "db_enum", "redis_attack", "nosql_scan",
+        "sqlmap_advanced", "sqlite_exploit", "mssql_exploit",
+        // Web 题中常出现的编码解码扩展（XSS payload / 参数编码绕过）
+        "html_entity_codec", "js_escape_codec", "qp_mime_codec", "ascii_unicode_codec",
+        "base_family", "radix_convert",
+        // 系统/杂项
+        "command_exec", "file_read_real", "file_write_real", "grep_search",
+        "web_fetch",
+      ],
       contextManager: new ContextManager(),
       toolExecutor,
       maxSteps: DEFAULT_SUB_MAX_STEPS,
@@ -84,18 +99,34 @@ export function createAgentSystem(
       role: "二进制漏洞挖掘与利用专家",
       systemPrompt: `你是 Pwn 专家。精通二进制漏洞挖掘与利用。
 当遇到 Pwn 类题目时，你应该按以下步骤进行：
-1. 初步分析：用 binary_analysis 检查文件类型、架构、保护机制（Canary/NX/PIE/RELRO）
-2. 信息提取：用 extract_strings 提取关键字符串（/bin/sh、flag 格式、系统调用名等）
-3. 漏洞扫描：用 vulnerability_scan 扫描危险函数调用（strcpy/gets/sprintf/system等）
-4. 深入分析：用 elf_got_plt_analysis 分析 GOT/PLT 动态链接，用 disassemble 查看反汇编，用 hex_view 查看二进制结构
-5. 利用规划：用 memory_layout 分析栈/堆布局，根据漏洞类型用 exploit_template 生成 pwntools 利用模板
-6. 远程交互：用 nc_remote_client 连接远程服务进行测试
-7. 策略选择：根据保护机制选择 ret2libc/ROP/ret2shellcode/UAF/格式化字符串等利用方式
+1. 初步分析：用 binary_analysis 检查文件类型、架构、保护机制（Canary/NX/PIE/RELRO），或直接用 pwn_static_analysis 一次性获取全部静态信息
+2. 环境检查：用 pwn_check_env 确认本机 pwntools/qemu/架构支持情况
+3. 信息提取：用 extract_strings 提取关键字符串（/bin/sh、flag 格式、系统调用名等），用 pwn_nm 查看完整符号表
+4. 漏洞扫描：用 vulnerability_scan 扫描危险函数调用（strcpy/gets/sprintf/system等）
+5. 深入反汇编：用 disassemble 或 pwn_objdump 查看完整反汇编/符号/节，用 pwn_radare2 进行交互式分析（strings/find/functions/disasm）
+6. 保护机制：用 pwn_checksec 获取专业级 checksec（Canary/NX/PIE/RELRO/Fortify）
+7. GOT/PLT：用 elf_got_plt_analysis 分析动态链接，用 hex_view 查看二进制结构
+8. ROP：用 pwn_rop_gadget 搜索可用 ROP gadget
+9. 利用规划：用 memory_layout 分析栈/堆布局，根据漏洞类型用 exploit_template 生成 pwntools 利用模板
+10. 远程交互：用 nc_remote_client 连接远程服务测试，或用 pwn_run_exploit 一步执行完整 pwntools 脚本
+11. 策略选择：根据保护机制选择 ret2libc/ROP/ret2shellcode/UAF/格式化字符串等利用方式
 请始终使用中文回复。`,
       toolNames: [
         "binary_analysis", "extract_strings", "vulnerability_scan",
         "disassemble", "hex_view", "elf_got_plt_analysis",
         "exploit_template", "nc_remote_client", "memory_layout",
+        "pwn_static_analysis", "pwn_check_env", "pwn_run_exploit",
+        "pwn_objdump", "pwn_checksec", "pwn_radare2",
+        "pwn_rop_gadget", "pwn_nm",
+      ],
+      crossCategoryToolNames: [
+        // Pwn 得到 foothold 后最常用的本地提权枚举
+        "suid_cap_audit", "process_service_audit", "kernel_exploit_match",
+        "file_permission_audit", "firewall_network_audit", "ssh_crack", "linpeas_report",
+        // 容器/内存取证联动
+        "container_escape_test", "memory_forensics", "pcap_deep_analyze",
+        "command_exec", "file_read_real", "file_write_real", "grep_search",
+        "hex_view",
       ],
       contextManager: new ContextManager(),
       toolExecutor,
@@ -125,6 +156,23 @@ export function createAgentSystem(
         "apk_analysis", "hex_view", "pseudocode_gen",
         "js_deobfuscate", "dotnet_decompile",
       ],
+      crossCategoryToolNames: [
+        // Mobile 逆向（APK/Smali/Frida/IPA）
+        "apk_deep_analysis", "dex_decompile", "smali_edit", "frida_hook",
+        "ipa_analysis", "ssl_pinning_bypass",
+        // PWN 进阶反汇编
+        "pwn_objdump", "pwn_radare2", "pwn_checksec", "pwn_nm",
+        // 编码/密码辅助（含本次新增扩展，解混淆常见 Base/RSA 分析/古典密码）
+        "encode_decode", "classical_cipher", "hash_compute", "hash_crack",
+        "base_family", "uu_xx_pp_encode", "qp_mime_codec", "html_entity_codec",
+        "js_escape_codec", "radix_convert", "punycode_codec", "ascii_unicode_codec",
+        "affine_cipher", "atbash_cipher", "vigenere_family", "railfence_cipher",
+        "adfgvx_cipher", "columnar_transposition", "baconian_cipher", "playfair_family",
+        "rc4_stream", "block_cipher_ext", "rsa_key_parser", "freq_ic_analysis", "pkcs7_padding",
+        // 混淆语言家族（BF / Morse / 敲击码 / JSFuck / AAEncode / JJEncode / Malbolge）
+        "brainfuck_family", "morse_code", "tap_code", "ctf_obfuscator_hub", "malbolge_run",
+        "command_exec", "file_read_real", "file_write_real", "grep_search",
+      ],
       contextManager: new ContextManager(),
       toolExecutor,
       maxSteps: DEFAULT_SUB_MAX_STEPS,
@@ -153,6 +201,23 @@ export function createAgentSystem(
         "classical_cipher", "rsa_tool", "rsa_advanced",
         "aes_encrypt", "des_encrypt",
         "modular_arithmetic", "lll_reduction", "mt19937_predict",
+      ],
+      crossCategoryToolNames: [
+        // 编码/取证/杂项辅助：隐写提取+编码检测+脚本执行
+        "entropy_analysis", "file_type_detect", "image_stego_check",
+        "archive_crack", "qr_decoder", "file_search_content", "traffic_analysis",
+        "command_exec", "file_read_real", "file_write_real",
+        "hex_view", "grep_search",
+        // CTF crypto 有时需要 Python 计算
+        "jwt_attack", // JWT 的 HS256 爆破 / alg_none 属于密码学联动
+        // 本次新增：编码扩展 + 古典密码扩展 + 现代密码扩展
+        "base_family", "uu_xx_pp_encode", "qp_mime_codec", "html_entity_codec",
+        "js_escape_codec", "radix_convert", "punycode_codec", "ascii_unicode_codec",
+        "affine_cipher", "atbash_cipher", "vigenere_family", "railfence_cipher",
+        "adfgvx_cipher", "columnar_transposition", "baconian_cipher", "playfair_family",
+        "rc4_stream", "block_cipher_ext", "rsa_key_parser", "freq_ic_analysis", "pkcs7_padding",
+        // 密码学中常出现的奇葩语言（作为提示工具使用）
+        "brainfuck_family", "morse_code", "tap_code", "malbolge_run",
       ],
       contextManager: new ContextManager(),
       toolExecutor,
@@ -184,6 +249,308 @@ export function createAgentSystem(
         "file_search_content", "file_list", "file_read_real",
         "file_write_real", "command_exec", "grep_search",
       ],
+      crossCategoryToolNames: [
+        // Misc 与取证深度联动
+        "disk_forensics", "filesystem_analyze", "registry_analyze",
+        "log_forensics", "timeline_reconstruct", "volatility_plugin",
+        "pcap_deep_analyze",
+        // Linux 本地枚举（杂项题很多藏在系统里）
+        "suid_cap_audit", "process_service_audit", "file_permission_audit",
+        // AI/OSINT 辅助
+        "image_exif_analyze", "reverse_image_search", "social_media_search",
+        "web_search_real", "whois_lookup",
+        // Web/数据库
+        "http_request", "web_fetch", "sqlmap_advanced", "sqlite_exploit",
+        "hex_view", "encode_decode",
+        // 本次新增：编码扩展 + 古典密码 + 混淆语言家族
+        "base_family", "uu_xx_pp_encode", "qp_mime_codec", "html_entity_codec",
+        "js_escape_codec", "radix_convert", "punycode_codec", "ascii_unicode_codec",
+        "affine_cipher", "atbash_cipher", "vigenere_family", "railfence_cipher",
+        "adfgvx_cipher", "columnar_transposition", "baconian_cipher", "playfair_family",
+        "brainfuck_family", "morse_code", "tap_code", "ctf_obfuscator_hub", "malbolge_run",
+        "rc4_stream", "block_cipher_ext", "rsa_key_parser", "freq_ic_analysis", "pkcs7_padding",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const forensicsAgent = new SubAgent(
+    {
+      id: "forensics",
+      name: "取证专家",
+      role: "数字取证与证据分析专家",
+      systemPrompt: `你是数字取证专家。精通磁盘取证、文件系统分析、注册表分析、日志取证、时间线重建和内存取证。
+当遇到 Forensics 类题目时，你应该按以下步骤进行：
+1. 磁盘取证：用 disk_forensics 分析磁盘镜像（分区表/已删除文件/文件恢复）
+2. 文件系统：用 filesystem_analyze 分析 NTFS/EXT4/FAT32/APFS 文件系统结构
+3. 注册表：用 registry_analyze 解析 Windows 注册表 hive（用户/自启/USB/网络记录）
+4. 日志分析：用 log_forensics 分析系统日志，识别入侵痕迹（登录失败/特权提升/Web攻击）
+5. 时间线：用 timeline_reconstruct 重建事件时间线（MAC时间+日志）
+6. 内存取证：用 volatility_plugin 执行 Volatility 3 插件（pslist/netscan/hashdump/malfind）
+7. 流量深度：用 pcap_deep_analyze 深度分析 PCAP（HTTP/DNS/FTP/SMB 协议还原/凭据提取）
+请始终使用中文回复。`,
+      toolNames: [
+        "disk_forensics", "filesystem_analyze", "registry_analyze",
+        "log_forensics", "timeline_reconstruct", "volatility_plugin",
+        "pcap_deep_analyze", "memory_forensics", "traffic_analysis",
+        "file_type_detect", "file_search_content", "file_read_real",
+        "command_exec", "grep_search", "hex_view",
+      ],
+      crossCategoryToolNames: [
+        // Forensics 联动 Linux 安全/杂项（镜像挂载后要做本地枚举）
+        "suid_cap_audit", "process_service_audit", "kernel_exploit_match",
+        "file_permission_audit", "firewall_network_audit", "ssh_crack",
+        // 其他取证/杂项
+        "entropy_analysis", "archive_crack", "qr_decoder", "video_audio_stego",
+        "document_stego", "file_list",
+        // OSINT/逆向
+        "image_exif_analyze", "reverse_image_search", "disassemble",
+        "pseudocode_gen", "encode_decode",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const mobileAgent = new SubAgent(
+    {
+      id: "mobile",
+      name: "移动安全专家",
+      role: "Android/iOS 应用安全与逆向专家",
+      systemPrompt: `你是移动安全专家。精通 Android/iOS 应用逆向、动态调试和安全分析。
+当遇到 Mobile 类题目时，你应该按以下步骤进行：
+1. APK 分析：用 apk_deep_analysis 深度分析 APK（AndroidManifest/资源/Smali/签名）
+2. DEX 反编译：用 dex_decompile 将 DEX 反编译为 Java 代码（jadx）
+3. Smali 编辑：用 smali_edit 反编译/修改/重打包/签名 APK
+4. 动态调试：用 frida_hook 执行 Frida 动态 hook 脚本（Java/Native 层）
+5. iOS 分析：用 ipa_analysis 分析 IPA（Mach-O 依赖/entitlements/class-dump/字符串）
+6. 抓包绕过：用 ssl_pinning_bypass 生成 SSL Pinning 绕过脚本
+请始终使用中文回复。`,
+      toolNames: [
+        "apk_deep_analysis", "dex_decompile", "smali_edit",
+        "frida_hook", "ipa_analysis", "ssl_pinning_bypass",
+        "apk_analysis", "binary_analysis", "hex_view",
+        "command_exec", "file_read_real",
+      ],
+      crossCategoryToolNames: [
+        // Mobile 与 Reverse 深度联动（DEX/伪代码/反汇编）
+        "disassemble", "packer_detect", "code_deobfuscate", "binary_compare",
+        "pseudocode_gen", "js_deobfuscate", "dotnet_decompile",
+        "pwn_objdump", "pwn_checksec", "extract_strings",
+        // 取证/杂项
+        "file_type_detect", "entropy_analysis", "file_search_content",
+        "grep_search", "file_write_real",
+        // 网络/HTTP/抓包联动
+        "ssl_info", "http_request", "waf_cdn_detect", "traffic_analysis",
+        "pcap_deep_analyze",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const blockchainAgent = new SubAgent(
+    {
+      id: "blockchain",
+      name: "区块链安全专家",
+      role: "智能合约审计与链上分析专家",
+      systemPrompt: `你是区块链安全专家。精通智能合约审计、EVM 逆向、链上交易分析和 RPC 查询。
+当遇到 Blockchain 类题目时，你应该按以下步骤进行：
+1. 源码分析：用 sol_disassemble 反汇编/反编译 Solidity 合约
+2. 字节码：用 evm_decompile 反编译 EVM 字节码（函数选择器/事件解析）
+3. 漏洞审计：用 contract_audit 审计合约漏洞（整数溢出/重入/访问控制/随机数）
+4. 重入检测：用 reentrancy_test 检测重入风险并生成 PoC
+5. 静态分析：用 slither_scan 执行 Slither 静态分析
+6. 交易追踪：用 tx_trace_analyze 分析链上交易 trace
+7. 链上查询：用 rpc_query 查询链上状态（余额/代码/存储）
+请始终使用中文回复。`,
+      toolNames: [
+        "sol_disassemble", "evm_decompile", "contract_audit",
+        "reentrancy_test", "slither_scan", "tx_trace_analyze",
+        "rpc_query", "encode_decode", "hex_view", "command_exec",
+      ],
+      crossCategoryToolNames: [
+        // 密码学/逆向联动（ECC/RSA/签名验证/反编译辅助）
+        "rsa_tool", "rsa_advanced", "modular_arithmetic", "hash_compute",
+        "hash_crack", "classical_cipher", "lll_reduction", "mt19937_predict",
+        "aes_encrypt", "disassemble", "code_deobfuscate", "pseudocode_gen",
+        // 网络/OSINT
+        "http_request", "web_fetch", "subdomain_enum", "whois_lookup",
+        "web_search_real",
+        // 杂项
+        "file_type_detect", "entropy_analysis", "file_read_real",
+        "file_write_real", "grep_search", "file_search_content",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const osintAgent = new SubAgent(
+    {
+      id: "osint",
+      name: "OSINT 专家",
+      role: "开源情报收集与关联分析专家",
+      systemPrompt: `你是 OSINT 开源情报专家。精通互联网搜索、WHOIS、社交媒体分析、地理定位和子域名枚举。
+当遇到 OSINT 类题目时，你应该按以下步骤进行：
+1. 搜索：用 web_search_real 搜索互联网获取线索
+2. 域名信息：用 whois_lookup 查询域名注册信息
+3. 社交媒体：用 social_media_search 查询用户名在各平台的关联
+4. 地理定位：用 geo_locate 根据 IP 或坐标定位位置
+5. 图片元数据：用 image_exif_analyze 分析图片 EXIF（GPS/相机/时间戳）
+6. 反向图片：用 reverse_image_search 搜索图片来源
+7. 子域名：用 subdomain_enum 枚举子域名
+8. 历史快照：用 wayback_lookup 查询 Wayback Machine 历史记录
+请始终使用中文回复。`,
+      toolNames: [
+        "web_search_real", "whois_lookup", "social_media_search",
+        "geo_locate", "image_exif_analyze", "reverse_image_search",
+        "subdomain_enum", "wayback_lookup", "dns_lookup", "ssl_info",
+        "http_request", "web_fetch",
+      ],
+      crossCategoryToolNames: [
+        // OSINT 联动取证/杂项（EXIF 本身已有，这里扩展杂项工具）
+        "file_type_detect", "entropy_analysis", "image_stego_check",
+        "video_audio_stego", "document_stego", "qr_decoder",
+        "file_search_content", "file_read_real", "file_write_real",
+        "grep_search", "command_exec", "traffic_analysis",
+        // 与网络/云安全联动
+        "port_scan", "dir_bruteforce", "header_analysis", "waf_cdn_detect",
+        "cloud_metadata_exploit",
+        // 与 AI/ML 联动
+        "llm_leak_test",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const cloudAgent = new SubAgent(
+    {
+      id: "cloud",
+      name: "云安全专家",
+      role: "云环境与容器安全攻防专家",
+      systemPrompt: `你是云安全专家。精通 AWS/阿里云/Azure/GCP 云环境安全、容器逃逸和 Kubernetes 攻击。
+当遇到 Cloud 类题目时，你应该按以下步骤进行：
+1. IAM 枚举：用 iam_enum 枚举云平台 IAM 资源（用户/角色/策略/密钥）
+2. 存储检测：用 s3_bucket_scan 检测对象存储 Bucket 权限和公开访问
+3. 容器逃逸：用 container_escape_test 检测容器逃逸风险（privileged/capabilities/sysfs）
+4. K8s 攻击：用 k8s_attack 测试 Kubernetes 攻击面（Pod 逃逸/SA 滥用/etcd 未授权）
+5. 元数据：用 cloud_metadata_exploit 利用云元数据服务获取凭据
+6. IaC 审计：用 terraform_audit 审计 Terraform/CloudFormation 配置安全
+请始终使用中文回复。`,
+      toolNames: [
+        "iam_enum", "s3_bucket_scan", "container_escape_test",
+        "k8s_attack", "cloud_metadata_exploit", "terraform_audit",
+        "ssrf_test", "http_request", "port_scan", "command_exec",
+      ],
+      crossCategoryToolNames: [
+        // 云安全与 Linux 本地枚举联动（云主机/容器逃逸后提权）
+        "suid_cap_audit", "process_service_audit", "kernel_exploit_match",
+        "file_permission_audit", "firewall_network_audit", "ssh_crack",
+        "linpeas_report",
+        // 数据库/密码
+        "db_connect_brute", "db_enum", "redis_attack", "nosql_scan",
+        "ssh_crack", "hash_crack",
+        // OSINT / Web 高级
+        "web_search_real", "whois_lookup", "subdomain_enum",
+        "waf_cdn_detect", "cors_audit", "dir_bruteforce", "ssl_info",
+        // 取证
+        "memory_forensics", "pcap_deep_analyze",
+        "file_read_real", "file_write_real", "grep_search", "file_search_content",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const iotAgent = new SubAgent(
+    {
+      id: "iot",
+      name: "IoT 安全专家",
+      role: "物联网固件分析与硬件安全专家",
+      systemPrompt: `你是 IoT 安全专家。精通固件提取与分析、UART/JTAG 调试、MQTT/CoAP 协议分析和 IoT 协议 Fuzz。
+当遇到 IoT 类题目时，你应该按以下步骤进行：
+1. 固件提取：用 firmware_extract 提取和解包固件（binwalk scan/extract/entropy）
+2. 签名扫描：用 binwalk_scan 识别固件中的嵌入文件和文件系统
+3. 硬件接口：用 uart_jtag_detect 识别 UART/JTAG 调试接口
+4. MQTT 分析：用 mqtt_analyze 分析 MQTT 协议（连接/订阅/发布/枚举）
+5. CoAP 分析：用 coap_analyze 分析 CoAP 协议（资源发现/GET/POST）
+6. 协议 Fuzz：用 iot_protocol_fuzz 对 IoT 协议进行模糊测试
+请始终使用中文回复。`,
+      toolNames: [
+        "firmware_extract", "binwalk_scan", "uart_jtag_detect",
+        "mqtt_analyze", "coap_analyze", "iot_protocol_fuzz",
+        "binary_analysis", "extract_strings", "hex_view",
+        "command_exec", "file_type_detect", "entropy_analysis",
+      ],
+      crossCategoryToolNames: [
+        // 固件解包后文件系统 / Linux 本地枚举
+        "disk_forensics", "filesystem_analyze", "suid_cap_audit",
+        "process_service_audit", "kernel_exploit_match",
+        "file_permission_audit", "firewall_network_audit", "linpeas_report",
+        // PWN 反汇编/漏洞利用（固件里的二进制）
+        "pwn_static_analysis", "pwn_objdump", "pwn_checksec",
+        "vulnerability_scan", "exploit_template", "disassemble",
+        "elf_got_plt_analysis", "memory_layout",
+        // 取证/密码/网络
+        "memory_forensics", "traffic_analysis", "pcap_deep_analyze",
+        "ssh_crack", "hash_crack", "encode_decode",
+        "file_read_real", "file_write_real", "grep_search",
+        "file_search_content",
+      ],
+      contextManager: new ContextManager(),
+      toolExecutor,
+      maxSteps: DEFAULT_SUB_MAX_STEPS,
+    },
+    toolRegistry
+  );
+
+  const aimlAgent = new SubAgent(
+    {
+      id: "aiml",
+      name: "AI/ML 对抗专家",
+      role: "大模型与机器学习系统安全专家",
+      systemPrompt: `你是 AI/ML 对抗安全专家。精通 LLM 提示注入、越狱测试、模型逆向、对抗样本和数据投毒检测。
+当遇到 AI/ML 类题目时，你应该按以下步骤进行：
+1. Prompt 注入：用 prompt_injection_test 测试 LLM 提示注入（直接/间接/泄露/覆盖）
+2. 越狱测试：用 jailbreak_test 测试 LLM 越狱（DAN/角色扮演/编码/翻译/前缀）
+3. 模型逆向：用 model_inversion 推断模型类型和训练数据
+4. 对抗样本：用 adversarial_sample 生成对抗样本（FGSM/PGD/TextBugger/HotFlip）
+5. 投毒检测：用 data_poison_detect 检测数据集投毒（统计/标签/后门/离群点）
+6. 泄露测试：用 llm_leak_test 测试 LLM 系统信息泄露（system prompt/训练数据/RAG源/配置）
+请始终使用中文回复。`,
+      toolNames: [
+        "prompt_injection_test", "jailbreak_test", "model_inversion",
+        "adversarial_sample", "data_poison_detect", "llm_leak_test",
+        "encode_decode", "http_request", "web_fetch", "command_exec",
+      ],
+      crossCategoryToolNames: [
+        // Web / OSINT / 杂项辅助
+        "web_search_real", "social_media_search", "whois_lookup",
+        "geo_locate", "file_type_detect", "entropy_analysis",
+        "image_stego_check", "image_exif_analyze", "qr_decoder",
+        "archive_crack", "grep_search", "file_read_real",
+        "file_write_real", "file_search_content",
+        // Web 高级 / 认证绕过 / JWT
+        "waf_cdn_detect", "auth_bypass", "jwt_attack",
+        "saml_oauth_audit", "cors_audit",
+        // 密码
+        "hash_crack", "classical_cipher",
+      ],
       contextManager: new ContextManager(),
       toolExecutor,
       maxSteps: DEFAULT_SUB_MAX_STEPS,
@@ -197,6 +564,13 @@ export function createAgentSystem(
   scheduler.registerAgent(reverseAgent);
   scheduler.registerAgent(cryptoAgent);
   scheduler.registerAgent(miscAgent);
+  scheduler.registerAgent(forensicsAgent);
+  scheduler.registerAgent(mobileAgent);
+  scheduler.registerAgent(blockchainAgent);
+  scheduler.registerAgent(osintAgent);
+  scheduler.registerAgent(cloudAgent);
+  scheduler.registerAgent(iotAgent);
+  scheduler.registerAgent(aimlAgent);
 
   const mainAgent = new MainAgent(
     contextManager,

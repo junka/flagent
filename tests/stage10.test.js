@@ -153,7 +153,7 @@ const baseData = (over = {}) => ({
     ok("create steps 空", s.getSteps().length === 0);
     ok("create 独立 ContextManager", !!s.getContextManager());
     ok("create 独立 PermissionManager", !!s.getPermissionManager());
-    ok("create 含 5 预设 agent", s.getScheduler().getAllAgents().length === 5);
+    ok("create 含 12 预设 agent", s.getScheduler().getAllAgents().length === 12);
     ok("deriveTitle 短文本原样", s.deriveTitle("短任务") === "短任务");
     const long = s.deriveTitle("a".repeat(40));
     ok("deriveTitle 长文本截断 30+…", long.length === 31 && long.endsWith("…"));

@@ -8,6 +8,10 @@
 - **侦察 → 分类 → 深挖**：非强制状态机的 prompt 工程方法论，先并发侦察再分类，避免未侦察就硬路由
 - **5 类 CTF 专家子智能体**：`web` / `pwn` / `reverse` / `crypto` / `misc`，各自独立 context 与工具子集
 - **动态子智能体**：`registerDynamicAgent` + `SPAWN_AGENT` —— 不落进预设类别的新题可按需 spawn 通用深挖 agent
+- **后台任务管理**：`BackgroundManager` 单例驱动后台分析任务，6 态状态机（PENDING→RUNNING→{COMPLETED|CRASHED|CANCELLED|STUCK}），心跳机制 + 卡死检测（默认 90s 预警 / 5min 判死），CLI 30s 自动健康报告，`/bgstart` `/bg` `/status` `/kill` 命令
+- **AbortSignal 取消 + 工具级超时**：MainAgent 每步检查取消信号，ToolExecutor 为每个工具注入 `Promise.race` 超时包装（默认 2min），任务级取消一键传播
+- **PWN 专业反汇编**：集成 `objdump` / `checksec` / `radare2` / `ROPgadget` / `nm` 五大系统级工具，覆盖静态分析到 ROP gadget 搜索全链路
+- **多平台 LLM 切换**：支持 `qianwen`（千问 DashScope）/ `bailian`（百炼 Workspace）/ `anthropic`（Anthropic API）三平台，CLI `/platform` 一键切换并写回配置
 - **并发安全**：ContextManager Promise 链式锁、ToolExecutor 信号量限流（默认 8）、PermissionManager 双检锁
 - **权限管控**：副作用工具（`command_exec` 等）逐次确认，本会话记忆，CLI `/permissions` 查看
 - **上下文管理**：滑动窗口 + Token 超阈值自动 LLM 摘要，`/summarize` 手动触发
@@ -20,36 +24,40 @@
 ```
 flagent/
 ├── src/
-│   ├── llm/client.ts                # DashScope（阿里云百炼）LLM 客户端
+│   ├── llm/
+│   │   ├── client.ts                # LLM 客户端（qianwen/bailian/anthropic 三平台）
+│   │   ├── global-config.ts         # 全局 LLM 配置（平台/apiKey/workspaceId/model 持久化）
+│   │   └── classify-error.ts        # LLM 错误分类器（超时/限流/配额/内容过滤）
 │   ├── context/
 │   │   └── context-manager.ts       # 上下文管理器（并发安全锁 + 滑动窗口 + 自动摘要）
 │   ├── permissions/
 │   │   └── permission-manager.ts    # 权限管理器（双检锁 + 会话记忆）
 │   ├── tools/
 │   │   ├── registry.ts              # 工具注册表（Zod 校验 + concurrent/requirePermission 元数据）
-│   │   ├── web-tools.ts             # Web 攻防工具（http_request/port_scan/sql_injection_test…）
-│   │   ├── pwn-tools.ts             # Pwn 工具（binary_analysis/disassemble/nc_remote_client…）
-│   │   ├── reverse-tools.ts         # 逆向工具（packer_detect/pseudocode_gen/js_deobfuscate…）
-│   │   ├── crypto-tools.ts          # 密码学工具（rsa_advanced/lll_reduction/mt19937_predict…）
-│   │   ├── misc-tools.ts            # 杂项工具（file_type_detect/image_stego_check/traffic_analysis…）
+│   │   ├── web-tools.ts             # Web 攻防工具（15 个：http_request/port_scan/sql_injection_test/ssti_test…）
+│   │   ├── pwn-tools.ts             # Pwn 工具（16 个：binary_analysis/pwn_objdump/pwn_checksec/pwn_radare2/pwn_rop_gadget/pwn_nm…）
+│   │   ├── reverse-tools.ts         # 逆向工具（9 个：packer_detect/pseudocode_gen/js_deobfuscate…）
+│   │   ├── crypto-tools.ts          # 密码学工具（11 个：rsa_advanced/lll_reduction/mt19937_predict…）
+│   │   ├── misc-tools.ts            # 杂项工具（15 个：image_stego_check/traffic_analysis/memory_forensics/command_exec…）
 │   │   ├── default-tools.ts         # 默认 mock 工具（web_search/code_search/file_read…）
 │   │   ├── factory.ts               # createToolRegistry（5 套工具一次注册，跨会话共享）
 │   │   └── index.ts
 │   ├── agents/
-│   │   ├── main-agent.ts            # 并发 ReAct 主控（多 ACTIONS/DELEGATE/PLAN/SPAWN_AGENT）
+│   │   ├── main-agent.ts            # 并发 ReAct 主控（多 ACTIONS/DELEGATE/PLAN/SPAWN_AGENT + AbortSignal + heartbeat）
 │   │   ├── sub-agent.ts             # 子智能体（独立 context + 工具越权隔离）
 │   │   ├── scheduler.ts             # 调度器（route + dispatchConcurrent + registerDynamicAgent）
-│   │   ├── tool-executor.ts         # 统一工具执行（并发限流 + 权限 + 串行/并发分组）
+│   │   ├── tool-executor.ts         # 统一工具执行（并发限流 + 权限 + 串行/并发分组 + 信号超时）
+│   │   ├── background-manager.ts    # 后台任务管理器（6 态状态机 + 心跳/卡死/取消/健康检查）
 │   │   ├── react-parser.ts          # ReAct 响应解析器（公共 + MainAgent 多动作解析）
 │   │   ├── factory.ts               # createAgentSystem（CLI/VSCode 唯一装配真相源）
 │   │   └── index.ts
 │   ├── session/
 │   │   ├── session-data.ts          # 会话序列化结构（SessionData/SerializableMessage）
 │   │   ├── session-store.ts         # 磁盘持久化（.flagent/sessions/<id>.json）
-│   │   ├── session.ts               # 单会话封装（agent 图 + 序列化/反序列化）
+│   │   ├── session.ts               # 单会话封装（agent 图 + 序列化/反序列化 + runBackground）
 │   │   ├── session-manager.ts       # 会话集合管理（创建/切换/恢复/删除）
 │   │   └── index.ts
-│   ├── cli/index.ts                 # CLI 入口（SessionManager + 会话命令 + 交互）
+│   ├── cli/index.ts                 # CLI 入口（SessionManager + 会话/平台/后台命令 + 30s 健康轮询）
 │   ├── vscode/
 │   │   ├── extension.ts             # VSCode 扩展入口（SessionManager + 侧边栏会话树 + 会话感知 webview）
 │   │   ├── session-tree-provider.ts # 侧边栏会话树数据源（活跃高亮/点击切换）
@@ -57,7 +65,7 @@ flagent/
 │   │   ├── package.json             # 扩展 manifest（视图/命令/菜单）
 │   │   └── tsconfig.json
 │   └── index.ts                     # 库导出
-├── tests/                           # 测试用例（单元 + e2e）
+├── tests/                           # 测试用例（单元 + e2e + verify-background）
 ├── .env.example
 ├── tsconfig.json
 └── package.json
@@ -80,9 +88,13 @@ cp .env.example .env
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `DASHSCOPE_API_KEY` | 阿里云百炼 API Key | - |
-| `WORKSPACE_ID` | 百炼 Workspace ID | `llm-v7cepeucys535ynp` |
-| `MODEL_NAME` | 模型名称 | `qwen3.8-max` |
+| `DASHSCOPE_API_KEY` | 阿里云百炼 API Key（qianwen/bailian 平台） | - |
+| `ANTHROPIC_API_KEY` | Anthropic API Key（anthropic 平台） | - |
+| `LLM_PLATFORM` | LLM 平台：`qianwen` / `bailian` / `anthropic` | `bailian` |
+| `WORKSPACE_ID` | 百炼 Workspace ID（仅 bailian 平台） | `llm-v7cepeucys535ynp` |
+| `MODEL_NAME` | 模型名称 | 平台相关（qwen3.8-max / claude-sonnet-4-20250514） |
+
+也可在 CLI 中用 `/platform`、`/model`、`/apikey` 动态切换并持久化写盘。
 
 ### 3. 构建 & 运行 CLI
 
@@ -115,8 +127,17 @@ CLI 启动时自动恢复最近会话（若无历史会话，首次提问自动�
 | `/context` | 查看当前会话上下文状态（消息数/Token/摘要） |
 | `/summarize` | 手动生成对话摘要（窗口外消息压缩） |
 | `/permissions` | 查看本会话已批准的副作用工具 |
+| `/platform [qianwen\|bailian\|anthropic]` | 查看/切换 LLM 平台，写回全局配置 |
+| `/model [名称]` | 查看/切换模型 |
+| `/apikey [key]` | 查看/设置 API Key（屏蔽显示） |
+| `/bgstart <任务描述>` | 启动后台分析任务（独立线程，前台不阻塞） |
+| `/bg [任务ID]` | 列出所有后台任务或查看指定任务详情 |
+| `/status [任务ID]` | 查看后台任务健康状态（含 thought/tool 历史） |
+| `/kill <任务ID\|all>` | 取消后台任务 |
 | `/clear` | 清除当前会话的对话历史与权限记忆 |
 | `/exit` | 退出系统 |
+
+后台任务运行期间，CLI 每 30 秒自动打印一次健康报告，若发现 STUCK / CRASHED 会红字提醒。
 
 ## 🧩 核心架构
 
@@ -127,10 +148,16 @@ CLI 启动时自动恢复最近会话（若无历史会话，首次提问自动�
   └─ MainAgent（主控，拥有全部工具）
        ├─ PLAN: 侦察目标 + 总体方案（可选，简单任务可跳过）
        ├─ ACTIONS: 并发只读采集（多个 concurrent 工具同时跑）
-       │     └─ ToolExecutor（信号量限流 + 权限确认）
+       │     └─ ToolExecutor（信号量限流 + 权限确认 + 工具级超时）
        ├─ SPAWN_AGENT: 按需注册通用深挖 agent（新题）
        └─ DELEGATE: 并发委派多个专家 SubAgent（各自独立 ReAct）
             └─ 统一落库观察 → 下一步统一思考 → FINAL_ANSWER
+
+  后台模式：/bgstart → BackgroundManager
+       ├─ 创建任务（PENDING→RUNNING）+ AbortController
+       ├─ MainAgent.run(signal, toolTimeoutMs) → 每步 heartbeat()
+       ├─ 健康检查（每 30s）：idleMs > 90s WARNING / > 5min STUCK
+       └─ /kill → abort() → MainAgent 抛出 AbortError → CRASHED/CANCELLED
 ```
 
 方法论（**侦察 → 分类 → 深挖**，非强制状态机）：
@@ -174,8 +201,8 @@ MainAgent 与所有 SubAgent 共用，统一权限与并发策略：
 
 | 智能体 | 角色 | 工具数 | 代表工具 |
 |--------|------|--------|----------|
-| `web` | Web 攻防专家 | 14 | `http_request` `port_scan` `dir_bruteforce` `sql_injection_test` `xss_test` `ssti_test` `ssrf_test` `file_upload_test` `header_analysis` |
-| `pwn` | 二进制漏洞挖掘与利用专家 | 9 | `binary_analysis` `extract_strings` `vulnerability_scan` `disassemble` `hex_view` `elf_got_plt_analysis` `exploit_template` `nc_remote_client` |
+| `web` | Web 攻防专家 | 15 | `http_request` `port_scan` `dir_bruteforce` `sql_injection_test` `xss_test` `ssti_test` `ssrf_test` `file_upload_test` `header_analysis` `dns_lookup` `ssl_info` |
+| `pwn` | 二进制漏洞挖掘与利用专家 | 17 | `binary_analysis` `extract_strings` `vulnerability_scan` `disassemble` `hex_view` `elf_got_plt_analysis` `exploit_template` `nc_remote_client` `memory_layout` `pwn_static_analysis` `pwn_check_env` `pwn_run_exploit` `pwn_objdump` `pwn_checksec` `pwn_radare2` `pwn_rop_gadget` `pwn_nm` |
 | `reverse` | 逆向工程与代码分析专家 | 11 | `binary_analysis` `disassemble` `packer_detect` `code_deobfuscate` `binary_compare` `apk_analysis` `pseudocode_gen` `js_deobfuscate` `dotnet_decompile` |
 | `crypto` | 密码分析与破解专家 | 11 | `encode_decode` `hash_crack` `classical_cipher` `rsa_tool` `rsa_advanced` `aes_encrypt` `des_encrypt` `modular_arithmetic` `lll_reduction` `mt19937_predict` |
 | `misc` | 隐写分析与取证专家 | 15 | `file_type_detect` `entropy_analysis` `image_stego_check` `qr_decoder` `archive_crack` `traffic_analysis` `memory_forensics` `file_search_content` `command_exec` |
@@ -198,6 +225,20 @@ MainAgent 与所有 SubAgent 共用，统一权限与并发策略：
 - `FINAL_ANSWER` — 任务完成
 
 工具采集与子智能体委派**同时并发推进**（`Promise.all`），结果统一落库供下一步思考。每步记录 `thought` / `action` / `observation` / `agentId` / `plan`。
+
+`run()` 方法支持 `AbortSignal`（取消信号）和 `toolTimeoutMs`（工具级超时），每步 stepStart/planning/react 前检查信号，在 stepStart/toolStart/toolResult 等节点调用 `heartbeat()` 刷新活动时间戳。
+
+### BackgroundManager（后台任务管理器）
+
+单例模式（`getBackgroundManager()`），让耗时分析任务在后台运行，前台定时检查卡死/crash。
+
+- **6 态状态机**：`PENDING → RUNNING → {COMPLETED | CRASHED | CANCELLED | STUCK}`
+- **心跳机制**：`heartbeat()` 刷新 `lastActivityAt`；`markStart()` / `markStep()` / `markComplete()` / `markCrash()` 驱动状态流转
+- **健康检查**：`healthCheck()` 按 `idleMs` 分三档：`HEALTHY`（< warn 90s）/ `WARNING`（>= 90s）/ `STUCK`（>= 5min 自动标记）
+- **取消传播**：`cancel(taskId)` 触发 `AbortController.abort()`，MainAgent 每步检查信号后抛出 `AbortError`
+- **工具级超时**：`toolTimeoutMs`（默认 2min）通过 `Promise.race` 包装每个工具执行，超时返回错误并建议调小阈值
+- **清理**：`cleanup(retentionMs)` 清理已结束且超过保留窗口的任务
+- **事件回调**：`onBackgroundEvent(taskId, event)` 将 AgentEvent（thought/tool/delegate 等）实时回调给调用方
 
 ## 🗂️ 会话管理（Session）
 
@@ -273,6 +314,8 @@ import {
   Scheduler,
   ToolExecutor,
   PermissionManager,
+  BackgroundManager,
+  getBackgroundManager,
   createWebTools,
   createPwnTools,
   createReverseTools,
@@ -330,21 +373,68 @@ async function main() {
 
 | 命令 | 范围 | 说明 |
 |------|------|------|
-| `npm test` / `npm run test:unit` | 阶段 0–10 单元 + 边界场景 | 303 项，无需网络/LLM（全 mock） |
+| `npm test` / `npm run test:unit` | 阶段 0–10 单元 + 边界场景 + 后台/PWN 验证 | 325+ 项，无需网络/LLM（全 mock） |
 | `npm run test:e2e` | 阶段 6/7/8/9/10 e2e | 5 项，真实 LLM + 网络抓取，需 `.env` |
 
 测试覆盖：
 
 - **`tests/stage{0..10}.test.js`** — 各阶段功能单元测试（stage10 覆盖会话序列化往返/磁盘持久化/切换恢复删除/上下文与权限隔离）
 - **`tests/edge-cases.test.js`** — 边界场景与错误处理（重复注册/未知工具/参数校验失败/工具抛错/权限拒绝并发/工具越权/解析容错/zod schema 推断等）
+- **`tests/verify-background.test.js`** — 后台任务管理器（10 项：单例/状态流转/心跳/卡死检测/取消/列表/清理/事件回调）+ PWN 专业工具 smoke（12 项：5 个工具的文件不存在/参数校验/注册元数据）
 - **`tests/e2e-*.test.js`** — 端到端真实 LLM 验证（并发抓取/动态 agent/简单任务跳过工具/编程式构建/双会话隔离 + resume 还原）
 
 ## 🛠️ 技术栈
 
-- **Vercel AI SDK v4**（`ai`、`@ai-sdk/openai`）— 接入阿里云百炼 DashScope
+- **Vercel AI SDK v4**（`ai`、`@ai-sdk/openai`）— 统一接入千问 DashScope / 百炼 Workspace / Anthropic API（OpenAI 兼容模式）
 - **Zod v4** — 运行时类型校验
 - **TypeScript**（strict）— 类型安全
 - **Node.js ≥ 18**
+
+## 🧭 CTF 题型覆盖与扩展规划
+
+### 当前覆盖（5 类预设 SubAgent + 66 个工具）
+
+| 题型 | 覆盖度 | SubAgent | 工具数 | 说明 |
+|------|--------|----------|--------|------|
+| Web | 充分 | `web` | 15 | SQL注入/XSS/SSRF/SSTI/命令注入/文件包含/文件上传/反序列化/目录爆破/端口扫描/DNS/SSL 全覆盖 |
+| Pwn | 充分 | `pwn` | 17 | 二进制分析/漏洞扫描/GOT-PLT/ROP gadget/checksec/objdump/radare2/pwntools 执行齐备 |
+| Reverse | 充分 | `reverse` | 11 | 反汇编/伪代码/壳检测/混淆检测/APK/JS/.NET/Java 反编译齐全 |
+| Crypto | 充分 | `crypto` | 11 | 古典密码/对称(RSA/AES/DES)/RSA高级攻击/格规约/MT19937/模运算齐全 |
+| Misc | 较充分 | `misc` | 15 | 隐写(图片/音视频/文档)/流量分析/内存取证/压缩包爆破/二维码/文件识别齐备 |
+
+### 缺失题型与扩展建议
+
+以下题型在当前 CTF 赛事中高频出现但尚未覆盖，可通过 `Scheduler.registerDynamicAgent()` 动态注册或补入 `factory.ts` 扩展：
+
+| 题型 | 优先级 | 建议 SubAgent | 建议核心工具 |
+|------|--------|---------------|-------------|
+| **Forensics 取证** | 高 | `forensics` | `disk_forensics`（磁盘镜像/dd/E01）、`filesystem_analyze`（NTFS/EXT4/APFS）、`registry_analyze`（Windows 注册表 hive）、`log_forensics`（事件日志/syslog）、`timeline_reconstruct`（MAC时间+日志重建）、`volatility_plugin`（Volatility 3 封装）、`pcap_deep_analyze`（协议还原/文件提取） |
+| **Mobile 移动安全** | 高 | `mobile` | `apk_deep_analysis`（apktool反编译+资源解析）、`dex_decompile`（jadx DEX→Java）、`smali_edit`（Smali编辑+重打包）、`frida_hook`（动态hook脚本执行）、`ipa_analysis`（iOS IPA分析）、`ssl_pinning_bypass`（证书绑定绕过） |
+| **Blockchain 区块链** | 中 | `blockchain` | `sol_disassemble`（Solidity反汇编）、`evm_decompile`（EVM字节码反编译）、`contract_audit`（漏洞审计）、`reentrancy_test`（重入攻击PoC）、`slither_scan`（Slither静态分析）、`tx_trace_analyze`（链上交易trace）、`rpc_query`（JSON-RPC查询） |
+| **OSINT 开源情报** | 中 | `osint` | `web_search_real`（真实搜索引擎API）、`whois_lookup`、`social_media_search`（社交媒体关联）、`geo_locate`（GPS/IP地理定位）、`image_exif_analyze`（EXIF元数据）、`reverse_image_search`（反向图片搜索）、`subdomain_enum`（子域名枚举）、`wayback_lookup`（历史快照） |
+| **Cloud 云安全** | 中低 | `cloud` | `iam_enum`（AWS/Aliyun IAM枚举）、`s3_bucket_scan`（对象存储权限检测）、`container_escape_test`（容器逃逸）、`k8s_attack`（K8s攻击）、`cloud_metadata_exploit`（元数据服务利用）、`terraform_audit`（IaC配置审计） |
+| **IoT 物联网** | 中低 | `iot` | `firmware_extract`（binwalk固件提取）、`binwalk_scan`（签名扫描）、`uart_jtag_detect`（UART/JTAG接口识别）、`mqtt_analyze`（MQTT协议分析）、`coap_analyze`（CoAP协议分析）、`iot_protocol_fuzz`（协议Fuzz） |
+| **AI/ML 对抗** | 低（前沿） | `aiml` | `prompt_injection_test`（Prompt注入）、`jailbreak_test`（越狱payload库）、`model_inversion`（模型逆向）、`adversarial_sample`（FGSM/PGD对抗样本）、`llm_leak_test`（系统提示泄露检测）、`model_fingerprint`（模型指纹识别） |
+
+### 扩展方式
+
+所有新题型均可通过两种方式接入，无需改动核心架构：
+
+1. **动态注册**（推荐，运行时扩展）：
+   ```typescript
+   scheduler.registerDynamicAgent({
+     id: "forensics",
+     name: "取证专家",
+     role: "数字取证与证据分析专家",
+     systemPrompt: "你是取证专家…",
+     toolNames: ["disk_forensics", "registry_analyze", "log_forensics", ...],
+     maxSteps: 8,
+   });
+   ```
+
+2. **预设注册**（编译时扩展）：在 [factory.ts](file:///Users/uqland/github/flagent/src/agents/factory.ts) 中新增 `SubAgent` 并 `scheduler.registerAgent()`，与现有 5 类预设 agent 并列。
+
+新增工具按现有模式在对应 `src/tools/<category>-tools.ts` 中实现，通过 `createToolRegistry()` 自动注册。每个工具只需定义 Zod schema + `execute` 函数 + 元数据（`concurrent` / `requirePermission` / `category` / `timeout`）。
 
 ## 📝 License
 

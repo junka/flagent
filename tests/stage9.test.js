@@ -45,9 +45,9 @@ const ok = (name, cond) => {
 
   const scheduler = mainAgent.getScheduler();
   const agents = scheduler.getAllAgents();
-  ok("预设 5 个子智能体", agents.length === 5);
+  ok("预设 12 个子智能体", agents.length === 12);
 
-  const presetIds = ["web", "pwn", "reverse", "crypto", "misc"];
+  const presetIds = ["web", "pwn", "reverse", "crypto", "misc", "forensics", "mobile", "blockchain", "osint", "cloud", "iot", "aiml"];
   ok("预设 id 齐全", presetIds.every((id) => scheduler.getAgent(id) !== undefined));
 
   // 每个预设子智能体都注入了共享 toolExecutor（运行时访问编译后的属性）
