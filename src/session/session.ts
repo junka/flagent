@@ -26,6 +26,8 @@ export interface RunOptions {
   onEvent?: (event: AgentEvent) => void;
   /** 多步骤 Plan 执行前的确认回调；返回 false 取消。 */
   confirmPlan?: ConfirmPlanFn;
+  /** 中断信号；触发后 mainAgent.run 与工具执行立即抛 AbortError。 */
+  signal?: AbortSignal;
 }
 
 export interface SessionCreateInit {
@@ -143,7 +145,9 @@ export class Session {
     }
 
     try {
-      const result = await this.mainAgent.run(task);
+      const result = await this.mainAgent.run(task, {
+        ...(options?.signal ? { signal: options.signal } : {}),
+      });
       // MainAgent.run 每次重置自身 steps；Session 是跨 run 历史真相源，累积保留
       this.steps = [...this.steps, ...result.steps];
       this.updatedAt = Date.now();

@@ -200,6 +200,7 @@ LLM 配置（全局，写入 ~/.flagent/config.json，重启后生效）:
   - 会话自动持久化到 .flagent/sessions/，重启后可 /switch 恢复
   - 思考过程实时流式输出；多步骤 Plan 会暂停等待确认，单步骤直接执行
   - 后台任务每 30s 自动打印健康摘要；长时间无活动会被标记 WARNING 或 STUCK，可 /kill 取消
+  - Ctrl+C：中断当前思考/工具执行；快速双击 Ctrl+C 退出 CLI
 `;
 
 function fmtTime(ts: number): string {
@@ -332,6 +333,34 @@ export async function startCLI(): Promise<void> {
   const sessionManager = new SessionManager({ toolRegistry, confirmFn });
   let mainAgentRunning = false; // run 期间拦截新输入（权限确认的 y/n 由 rl.question 处理）
   let verbose = false; // /verbose 切换：默认精简，开启后显示完整思考与工具结果
+
+  // --- Ctrl+C 交互：单次中断当前运行，快速双击退出 ---
+  let currentAbortController: AbortController | null = null;
+  let lastSigintTime = 0;
+  const SIGINT_DOUBLE_THRESHOLD = 500; // ms：500ms 内两次 Ctrl+C 视为退出
+
+  rl.on("SIGINT", () => {
+    const now = Date.now();
+
+    // 正在运行 → 中断当前任务
+    if (mainAgentRunning && currentAbortController) {
+      currentAbortController.abort(new Error("用户中断 (Ctrl+C)"));
+      console.log("\n\n⚡ 已中断当前任务（再按 Ctrl+C 退出 CLI）。\n");
+      lastSigintTime = now;
+      return;
+    }
+
+    // 非运行态 / 已中断后快速双击 → 退出（只调 rl.close()，告别由 close 事件统一打印，避免重复）
+    if (now - lastSigintTime < SIGINT_DOUBLE_THRESHOLD) {
+      rl.close();
+      return;
+    }
+
+    // 非运行态首次 → 提示再按一次退出
+    lastSigintTime = now;
+    console.log("\n  (再按 Ctrl+C 退出 CLI，或输入问题继续对话)");
+    rl.prompt();
+  });
 
   /** 更新提示符，含当前会话标题。 */
   const refreshPrompt = (): void => {
@@ -1053,23 +1082,34 @@ export async function startCLI(): Promise<void> {
     };
 
     try {
-      await sessionManager.run(input, { onEvent, confirmPlan });
+      currentAbortController = new AbortController();
+      await sessionManager.run(input, {
+        onEvent,
+        confirmPlan,
+        signal: currentAbortController.signal,
+      });
     } catch (error: any) {
-      const d = classifyLLMError(error);
-      if (d.kind !== "unknown") {
-        const cfg = getLLMConfig();
-        console.error("\n❌ " + d.tag + ": " + d.detail + "\n");
-        console.error("  当前平台: " + cfg.platform + "  模型: " + cfg.modelName + "  baseUrl: " + cfg.baseUrl);
-        console.error("  API Key: " + (cfg.apiKey ? "已设置（长度" + cfg.apiKey.length + "）" : "未设置 ⚠️"));
-        console.error("  建议:");
-        for (const tip of d.tips) {
-          console.error("    " + tip.replace("{model}", cfg.modelName).replace("{baseUrl}", cfg.baseUrl));
-        }
-        console.error("");
+      // 用户 Ctrl+C 中断不算错误，静默处理
+      if (error?.name === "AbortError" || /\b(abort|中断|Ctrl\+C)\b/i.test(error?.message || "")) {
+        console.log("  ⏹️  任务已中断。");
       } else {
-        console.error("\n❌ 执行出错: " + d.detail + "\n");
+        const d = classifyLLMError(error);
+        if (d.kind !== "unknown") {
+          const cfg = getLLMConfig();
+          console.error("\n❌ " + d.tag + ": " + d.detail + "\n");
+          console.error("  当前平台: " + cfg.platform + "  模型: " + cfg.modelName + "  baseUrl: " + cfg.baseUrl);
+          console.error("  API Key: " + (cfg.apiKey ? "已设置（长度" + cfg.apiKey.length + "）" : "未设置 ⚠️"));
+          console.error("  建议:");
+          for (const tip of d.tips) {
+            console.error("    " + tip.replace("{model}", cfg.modelName).replace("{baseUrl}", cfg.baseUrl));
+          }
+          console.error("");
+        } else {
+          console.error("\n❌ 执行出错: " + d.detail + "\n");
+        }
       }
     } finally {
+      currentAbortController = null;
       mainAgentRunning = false;
     }
 
