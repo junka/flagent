@@ -7,9 +7,6 @@ import {
   type GlobalConfig,
 } from "../config/global-config";
 
-// quiet: 抑制 dotenv 17 的 "injected env" 启动提示，避免干扰 CLI 输出
-dotenv.config({ quiet: true });
-
 export type { Platform };
 
 export interface ModelInfo {
@@ -26,20 +23,45 @@ export interface LLMConfig {
   baseUrl: string;
 }
 
-// ---- 初始化：环境变量 > 全局配置(~/.flagent/config.json) > .env > 默认值 ----
+// ---- 优先级：shell 环境变量 > 全局配置(~/.flagent/config.json) > .env 文件 > 默认值 ----
+// 先只加载 .env 的注入（不覆盖 shell 已有 env），再按上述顺序取值：
+//   - process.env.X 在 dotenv 前已存在 = shell 环境变量（最高优先级）
+//   - process.env.X 只有 dotenv 注入后才有 = .env 内容（最低优先级）
+const dotenvBefore = { ...process.env };
+dotenv.config({ override: false, quiet: true });
+const envFile: Record<string, string> = {};
+for (const k of Object.keys(process.env)) {
+  if (dotenvBefore[k] === undefined && process.env[k] !== undefined) {
+    envFile[k] = process.env[k]!;
+  }
+}
+// 读取 shell 原生 env 的 helper：只有在 dotenv 加载前就有的才算
+const shellEnv = (k: string): string | undefined => dotenvBefore[k];
+
 const globalCfg: Partial<GlobalConfig> = readGlobalConfig() || {};
 
 let PLATFORM: Platform =
-  (process.env.PLATFORM as Platform | undefined) || globalCfg.platform || "bailian";
-// ANTHROPIC_API_KEY 优先级更高（用户配了就用），否则回退 DASHSCOPE_API_KEY/全局配置
+  (shellEnv("PLATFORM") as Platform | undefined) ||
+  globalCfg.platform ||
+  (envFile.PLATFORM as Platform | undefined) ||
+  "bailian";
+// ANTHROPIC_API_KEY 优先级更高（用户配了就用），否则回退 DASHSCOPE_API_KEY/全局配置/.env
 let API_KEY: string =
-  process.env.ANTHROPIC_API_KEY ||
-  process.env.DASHSCOPE_API_KEY ||
-  (globalCfg.apiKey || "");
+  shellEnv("ANTHROPIC_API_KEY") ||
+  shellEnv("DASHSCOPE_API_KEY") ||
+  globalCfg.apiKey ||
+  envFile.ANTHROPIC_API_KEY ||
+  envFile.DASHSCOPE_API_KEY ||
+  "";
 let WORKSPACE_ID: string =
-  process.env.WORKSPACE_ID || globalCfg.workspaceId || "";
+  shellEnv("WORKSPACE_ID") ||
+  globalCfg.workspaceId ||
+  envFile.WORKSPACE_ID ||
+  "";
 let MODEL_NAME: string =
-  process.env.MODEL_NAME || globalCfg.modelName ||
+  shellEnv("MODEL_NAME") ||
+  globalCfg.modelName ||
+  envFile.MODEL_NAME ||
   (PLATFORM === "anthropic" ? "claude-3-5-sonnet-20241022" : "qwen3.8-max");
 
 /** Anthropic 平台常用的默认模型，切换到 anthropic 且当前为 qwen 模型时自动兜底。 */
