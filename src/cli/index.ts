@@ -669,14 +669,26 @@ export async function startCLI(): Promise<void> {
       const taskBadge = " [BG]";
 
       /** 后台事件打印：复用 verbose 策略（与前台相同的视觉）。 */
+      let bgStreamingThinking = false;
       const onEvent = (event: AgentEvent): void => {
         switch (event.type) {
           case "stepStart":
             if (verbose)
               console.log(`\n${taskBadge} ━━━ Step ${event.step}/${event.maxSteps} ━━━`);
             break;
+          case "thinking": {
+            if (!bgStreamingThinking) {
+              bgStreamingThinking = true;
+              process.stdout.write(`\n${taskBadge} 💭 `);
+            }
+            process.stdout.write(event.delta);
+            break;
+          }
           case "thought": {
-            if (verbose) {
+            if (bgStreamingThinking) {
+              process.stdout.write("\n");
+              bgStreamingThinking = false;
+            } else if (verbose) {
               console.log(`\n${taskBadge} 💭 思考:`);
               console.log(indent(event.thought, "        "));
             } else {
@@ -686,6 +698,7 @@ export async function startCLI(): Promise<void> {
             break;
           }
           case "plan": {
+            if (bgStreamingThinking) { process.stdout.write("\n"); bgStreamingThinking = false; }
             const tag = event.isMultiStep ? "（多步骤·待确认）" : "（单步骤·直接执行）";
             console.log(`\n${taskBadge} 📋 Plan${tag}:`);
             console.log(indent(event.plan, "       "));
@@ -697,6 +710,7 @@ export async function startCLI(): Promise<void> {
             );
             break;
           case "actionStart":
+            if (bgStreamingThinking) { process.stdout.write("\n"); bgStreamingThinking = false; }
             console.log(
               `${taskBadge} 🔧 执行工具: ${event.actions
                 .map((a) => a.toolName).join(", ")}`
@@ -756,8 +770,20 @@ export async function startCLI(): Promise<void> {
       };
       const confirmPlan = (_plan: string): Promise<boolean> => {
         return new Promise((resolve) => {
+          let settled = false;
+          const finish = (val: boolean) => {
+            if (settled) return;
+            settled = true;
+            rl.removeListener("SIGINT", onSigint);
+            resolve(val);
+          };
+          const onSigint = () => {
+            console.log(`\n${taskBadge} ⏹️  已取消该计划（Ctrl+C）`);
+            finish(false);
+          };
+          rl.on("SIGINT", onSigint);
           rl.question(`\n${taskBadge} ⏸️  多步骤 Plan，是否执行? (y/n) `, (answer) => {
-            resolve(answer.trim().toLowerCase().startsWith("y"));
+            finish(answer.trim().toLowerCase().startsWith("y"));
           });
         });
       };
@@ -957,12 +983,61 @@ export async function startCLI(): Promise<void> {
       return;
     }
 
+    // ── 拦截未识别的斜杠命令：不进 LLM，直接提示 ──
+    if (input.startsWith("/")) {
+      const cmd = input.split(/\s+/)[0];
+      // 命令用法表（cmd → 用法说明）
+      const CMD_USAGE: Record<string, string> = {
+        "/help": "/help",
+        "/exit": "/exit",
+        "/quit": "/quit",
+        "/verbose": "/verbose",
+        "/sessions": "/sessions",
+        "/bg": "/bg",
+        "/clear": "/clear",
+        "/compact": "/compact",
+        "/new": "/new [标题]",
+        "/title": "/title [新标题]",
+        "/platform": "/platform [qianwen|bailian|anthropic]",
+        "/model": "/model [模型名]",
+        "/switch": "/switch <id>",
+        "/delete": "/delete <id>",
+        "/bgstart": "/bgstart <任务描述>",
+        "/status": "/status [taskId]",
+        "/kill": "/kill <taskId>",
+      };
+      if (!(cmd in CMD_USAGE)) {
+        console.log(
+          `\n⚠️  未知命令: ${cmd}\n` +
+          `  可用命令: ${Object.keys(CMD_USAGE).join(" ")}\n`
+        );
+        rl.prompt();
+        return;
+      }
+      const extra = input.slice(cmd.length).trim();
+      const usage = CMD_USAGE[cmd];
+      if (extra) {
+        console.log(
+          `\n⚠️  命令 "${cmd}" 不接受额外参数 "${extra}"。\n` +
+          `  用法: ${usage}\n`
+        );
+      } else {
+        console.log(
+          `\n⚠️  命令 "${cmd}" 用法不正确。\n` +
+          `  用法: ${usage}\n`
+        );
+      }
+      rl.prompt();
+      return;
+    }
+
     // 普通任务：经 SessionManager 执行（无活动会话则自动新建）
     // 通过 onEvent 流式输出思考/工具执行过程；多步骤 Plan 经 confirmPlan 门控
-    console.log("\n🤖 正在思考...");
     mainAgentRunning = true;
 
-    /** 流式事件渲染：verbose 控制思考/结果详细程度，工具执行实时打印 */
+    /** 流式事件渲染：thinking delta 实时打印，thought 事件不再重复 */
+    let streamingThinking = false; // 当前是否正在流式输出思考
+
     const onEvent = (event: AgentEvent): void => {
       switch (event.type) {
         case "stepStart":
@@ -970,8 +1045,22 @@ export async function startCLI(): Promise<void> {
             console.log(`\n━━━ Step ${event.step}/${event.maxSteps} ━━━`);
           break;
 
+        case "thinking": {
+          // 首个 delta → 打印行头
+          if (!streamingThinking) {
+            streamingThinking = true;
+            process.stdout.write("\n  💭 ");
+          }
+          process.stdout.write(event.delta);
+          break;
+        }
+
         case "thought": {
-          if (verbose) {
+          // 流式已输出完整思考，只需关闭行；非流式 fallback 正常打印
+          if (streamingThinking) {
+            process.stdout.write("\n");
+            streamingThinking = false;
+          } else if (verbose) {
             console.log(`\n  💭 思考:`);
             console.log(indent(event.thought, "     "));
           } else {
@@ -982,6 +1071,7 @@ export async function startCLI(): Promise<void> {
         }
 
         case "plan": {
+          if (streamingThinking) { process.stdout.write("\n"); streamingThinking = false; }
           const tag = event.isMultiStep ? "（多步骤·待确认）" : "（单步骤·直接执行）";
           console.log(`\n  📋 Plan${tag}:`);
           console.log(indent(event.plan, "     "));
@@ -997,6 +1087,7 @@ export async function startCLI(): Promise<void> {
           break;
 
         case "actionStart":
+          if (streamingThinking) { process.stdout.write("\n"); streamingThinking = false; }
           console.log(
             `  🔧 执行工具: ${event.actions
               .map((a) => a.toolName)
@@ -1049,6 +1140,7 @@ export async function startCLI(): Promise<void> {
         }
 
         case "finalAnswer":
+          if (streamingThinking) { process.stdout.write("\n"); streamingThinking = false; }
           console.log(`\n${"─".repeat(56)}`);
           console.log(`✅ 最终回答：`);
           console.log("─".repeat(56));
@@ -1064,19 +1156,31 @@ export async function startCLI(): Promise<void> {
           console.log(`\n📈 执行统计：`);
           console.log(`   耗时: ${(event.duration / 1000).toFixed(1)}s`);
           console.log(`   Token 数: ${event.totalTokens}`);
-          console.log(
-            `   状态: ${event.success ? "✓ 成功" : "✗ 未完成"}\n`
-          );
+          const statusLabel = event.success ? "✓ 成功" : "✗ 已取消/未完成";
+          console.log(`   状态: ${statusLabel}\n`);
           break;
         }
       }
     };
 
-    /** 多步骤 Plan 门控：rl.question 询问 y/n（mainAgentRunning 期间不会被 line 事件拦截） */
+    /** 多步骤 Plan 门控：rl.question 询问 y/n；Ctrl+C 时直接 resolve(false) 取消 */
     const confirmPlan = (_plan: string): Promise<boolean> => {
       return new Promise((resolve) => {
+        let settled = false;
+        const finish = (val: boolean) => {
+          if (settled) return;
+          settled = true;
+          rl.removeListener("SIGINT", onSigint);
+          resolve(val);
+        };
+        const onSigint = () => {
+          // Ctrl+C 在 Plan 确认期间 → 视为取消，不要卡住
+          console.log("\n  ⏹️  已取消该计划（Ctrl+C）");
+          finish(false);
+        };
+        rl.on("SIGINT", onSigint);
         rl.question(`\n  ⏸️  上述 Plan 为多步骤，是否执行? (y/n) `, (answer) => {
-          resolve(answer.trim().toLowerCase().startsWith("y"));
+          finish(answer.trim().toLowerCase().startsWith("y"));
         });
       });
     };
@@ -1123,10 +1227,196 @@ export async function startCLI(): Promise<void> {
   });
 }
 
+/** 命令行参数解析结果。 */
+interface CliFlags {
+  help: boolean;
+  version: boolean;
+  platform?: string;
+  model?: string;
+  models: boolean; // --models 列出可用模型后退出
+  workspaceId?: string;
+  apiKey?: string;
+  prompt?: string; // <prompt>：非交互模式下一次性执行任务
+  rest: string[];  // 未识别参数（拼进 prompt）
+}
+
+function parseCliArgs(argv: string[]): CliFlags {
+  const flags: CliFlags = { help: false, version: false, models: false, rest: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const take = () => argv[++i];
+    switch (a) {
+      case "-h":
+      case "--help": flags.help = true; break;
+      case "-v":
+      case "--version": flags.version = true; break;
+      case "--models": flags.models = true; break;
+      case "--platform": case "-p": flags.platform = take(); break;
+      case "--model": case "-m": flags.model = take(); break;
+      case "--workspace": case "-w": flags.workspaceId = take(); break;
+      case "--api-key": case "-k": flags.apiKey = take(); break;
+      case "--": while (++i < argv.length) flags.rest.push(argv[i]); break;
+      default:
+        if (a.startsWith("--platform=")) flags.platform = a.slice("--platform=".length);
+        else if (a.startsWith("--model=")) flags.model = a.slice("--model=".length);
+        else if (a.startsWith("--workspace=")) flags.workspaceId = a.slice("--workspace=".length);
+        else if (a.startsWith("--api-key=")) flags.apiKey = a.slice("--api-key=".length);
+        else if (!a.startsWith("-")) flags.rest.push(a);
+        else {
+          console.error(`⚠️  未知选项: ${a}（用 --help 查看用法）`);
+        }
+    }
+  }
+  if (flags.rest.length) flags.prompt = flags.rest.join(" ");
+  return flags;
+}
+
+function printVersion() {
+  // 直接从 package.json 读，避免 require 路径在 link/pack 下漂移
+  const pkg = require("../../package.json");
+  console.log(`flagent ${pkg.version}`);
+}
+
+function printHelp() {
+  console.log(`用法:
+  flagent [选项] [任务提示...]
+
+选项:
+  -h, --help              显示本帮助
+  -v, --version           显示版本号
+  --models                列出当前平台可用模型并退出
+  -p, --platform <name>   切换平台: qianwen | bailian | anthropic（写 ~/.flagent/config.json）
+  -m, --model <name>      切换对话模型（持久化）
+  -w, --workspace <id>    设置百炼 WorkspaceId（bailian 平台需要，持久化）
+  -k, --api-key <key>     设置 API Key（持久化，权限 0600）
+
+非交互执行:
+  flagent 帮我分析 base64 加密的字符串 'SGFja2VyIQ=='     直接输入任务，执行完退出
+  echo '1+1 等于几' | flagent                            从 stdin 读任务（管道模式）
+
+交互模式:
+  flagent                                                 进入交互式多智能体控制台
+
+示例:
+  flagent -p qianwen                                      切换到千问平台
+  flagent -m deepseek-v4-flash-0731                        设置模型
+  flagent --models                                        列出平台模型
+  flagent 扫描 127.0.0.1 的常用端口并报告结果            一次性执行任务
+`);
+}
+
 // 入口点：直接运行时启动 CLI
 if (require.main === module) {
-  startCLI().catch((err) => {
+  (async () => {
+    const flags = parseCliArgs(process.argv.slice(2));
+
+    // 1. --help / --version：无需依赖，立即处理
+    if (flags.help) { printHelp(); return; }
+    if (flags.version) { printVersion(); return; }
+
+    // 2. 命令行传入的持久化配置（--platform / --model / --workspace / --api-key）
+    if (flags.platform || flags.model || flags.workspaceId || flags.apiKey) {
+      try {
+        setLLMConfig({
+          ...(flags.platform ? { platform: flags.platform as Platform } : {}),
+          ...(flags.model ? { modelName: flags.model } : {}),
+          ...(flags.workspaceId ? { workspaceId: flags.workspaceId } : {}),
+          ...(flags.apiKey ? { apiKey: flags.apiKey } : {}),
+        });
+        await writeGlobalConfig({
+          platform: getLLMConfig().platform,
+          modelName: getLLMConfig().modelName,
+          workspaceId: getLLMConfig().workspaceId,
+          apiKey: getLLMConfig().apiKey,
+        });
+        const c = getLLMConfig();
+        console.log(`✅ 已保存配置: platform=${c.platform} model=${c.modelName} workspace=${c.workspaceId || "(无)"} key=${c.apiKey ? "已设置" : "未设置"}`);
+      } catch (e: any) {
+        console.error("❌ 配置写入失败:", e.message);
+        process.exit(1);
+      }
+      if (!flags.models && !flags.prompt) return;
+    }
+
+    // 3. --models：列出可用模型
+    if (flags.models) {
+      try {
+        const table = await listAvailableModels();
+        console.log(table);
+      } catch (e: any) {
+        console.error("❌ 列模型失败:", e.message);
+        process.exit(1);
+      }
+      if (!flags.prompt) return;
+    }
+
+    // 4. 非交互一次性执行模式（命令行给了 prompt，或从 stdin 管道读入）
+    const stdinPrompt = !process.stdin.isTTY ? await new Promise<string>((resolve) => {
+      let buf = "";
+      process.stdin.on("data", (c) => buf += c);
+      process.stdin.on("end", () => resolve(buf.trim()));
+      process.stdin.resume();
+    }) : "";
+    const oneShotPrompt = flags.prompt || stdinPrompt;
+    if (oneShotPrompt) {
+      await runOneShot(oneShotPrompt);
+      return;
+    }
+
+    // 5. 交互模式：必须有 TTY
+    if (!process.stdin.isTTY) {
+      console.error("❌ 非交互环境：请通过 `flagent 任务描述` 或 `cat task.txt | flagent` 执行，或在终端内使用 `flagent` 进入交互。");
+      process.exit(2);
+    }
+    await startCLI();
+  })().catch((err) => {
     console.error("❌ 启动失败:", err.message);
     process.exit(1);
   });
+}
+
+/** 非交互一次性任务执行：跑一遍 Session 并打印 finalAnswer。 */
+async function runOneShot(task: string): Promise<void> {
+  const { createToolRegistry } = require("../tools/factory");
+  const { SessionManager } = require("../session/session-manager");
+  const toolRegistry = createToolRegistry();
+  const mgr = new SessionManager({
+    toolRegistry,
+    confirmFn: async () => true, // 非交互模式下默认允许副作用工具；可加 --dry 开关禁用
+  });
+  let titlePrinted = false;
+  const final = await mgr.run(task, {
+    onEvent: (ev: AgentEvent) => {
+      switch (ev.type) {
+        case "thinking": process.stdout.write(ev.delta); break;
+        case "thought":  process.stdout.write("\n\n"); break;
+        case "toolStart":
+          if (!titlePrinted) { process.stdout.write("\n"); titlePrinted = true; }
+          process.stdout.write(`🔧 ${ev.action.toolName}... `); break;
+        case "toolEnd":
+          process.stdout.write(ev.result.success ? "✓\n" : `✗ ${(ev.result as any).error || "failed"}\n`); break;
+        case "finalAnswer":
+          console.log("\n" + "─".repeat(56));
+          console.log(ev.answer);
+          console.log("─".repeat(56));
+          break;
+      }
+    },
+    confirmPlan: async () => true,
+  });
+  if (!final) {
+    // finalAnswer 没有事件落下来，兜底：从最后一条 assistant 消息里取
+    const cur = mgr.current();
+    if (cur) {
+      const msgs = (cur as any).getContextManager().getActiveMessages();
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "assistant") {
+          console.log("\n" + "─".repeat(56));
+          console.log(msgs[i].content);
+          console.log("─".repeat(56));
+          break;
+        }
+      }
+    }
+  }
 }

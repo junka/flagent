@@ -14,6 +14,7 @@ export { type SpawnAgentRequest };
 
 export type AgentEvent =
   | { type: "stepStart"; step: number; maxSteps: number }
+  | { type: "thinking"; step: number; delta: string }
   | { type: "thought"; step: number; thought: string }
   | { type: "plan"; step: number; plan: string; isMultiStep: boolean }
   | { type: "planConfirmed"; step: number; confirmed: boolean }

@@ -9,7 +9,7 @@ import {
 } from "./tool-executor";
 import { parseMainReactResponse } from "./react-parser";
 import type { AgentEvent, ConfirmPlanFn } from "./agent-events";
-import { generateText } from "ai";
+import { streamText } from "ai";
 import { model } from "../llm/client";
 
 export interface AgentStep {
@@ -125,8 +125,9 @@ export class MainAgent extends EventEmitter {
           content: stepResult.answer,
         });
 
+        const isCancelled = stepResult.cancelled === true;
         const result: AgentResult = {
-          success: true,
+          success: !isCancelled,
           finalAnswer: stepResult.answer,
           steps: this.steps,
           totalTokens: this.contextManager.getTotalTokens(),
@@ -134,7 +135,7 @@ export class MainAgent extends EventEmitter {
         };
         this.emitEvent({
           type: "complete",
-          success: true,
+          success: result.success,
           finalAnswer: stepResult.answer,
           duration: result.duration,
           totalTokens: result.totalTokens,
@@ -203,6 +204,7 @@ export class MainAgent extends EventEmitter {
     isComplete: boolean;
     needsMoreInfo: boolean;
     answer: string;
+    cancelled?: boolean;
   }> {
     const signal = opts?.signal;
     const toolTimeoutMs = opts?.toolTimeoutMs;
@@ -280,11 +282,19 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
 - 工具调用格式必须为 工具名(JSON参数)
 - 解题/分析类任务的 FINAL_ANSWER 必须含 Flag + 可手动复现的逐步 Writeup（每步写清：操作、观察、推理）；简单问答可直接回答`;
 
-    const { text } = await generateText({
+    // ── 流式输出：逐 token emit thinking delta，完成后解析完整文本 ──
+    const streamResult = streamText({
       model,
       prompt,
       ...(signal ? { abortSignal: signal } : {}),
     });
+
+    let text = "";
+    for await (const delta of streamResult.textStream) {
+      text += delta;
+      // 逐段 emit，CLI 端实时打印
+      this.emitEvent({ type: "thinking", step, delta });
+    }
     throwIfAborted();
 
     const { thought, plan, actions, delegates, spawnAgents, finalAnswer } =
@@ -382,6 +392,7 @@ FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类�
             isComplete: true,
             needsMoreInfo: false,
             answer: "用户已取消该计划。",
+            cancelled: true,
           };
         }
       }
