@@ -7,10 +7,10 @@ import {
   type ActionResult,
   type PlannedAction,
 } from "./tool-executor";
-import { parseMainReactResponse } from "./react-parser";
 import type { AgentEvent, ConfirmPlanFn } from "./agent-events";
-import { streamText } from "ai";
+import { streamText, hasToolCall, isStepCount, type ModelMessage } from "ai";
 import { model } from "../llm/client";
+import { createBuiltinTools } from "./builtin-tools";
 
 export interface AgentStep {
   step: number;
@@ -99,6 +99,8 @@ export class MainAgent extends EventEmitter {
     const signal = options?.signal;
     const toolTimeoutMs = options?.toolTimeoutMs;
     this.steps = [];
+    let currentStep = 0;
+    let finalAnswer = "";
 
     const throwIfAborted = (): void => {
       if (signal?.aborted) {
@@ -113,122 +115,7 @@ export class MainAgent extends EventEmitter {
       content: userTask,
     });
 
-    for (let step = 1; step <= this.maxSteps; step++) {
-      throwIfAborted();
-      this.emitEvent({ type: "stepStart", step, maxSteps: this.maxSteps });
-      const stepResult = await this.reactStep(step, userTask, { signal, toolTimeoutMs });
-      this.emitEvent({ type: "stepEnd", step });
-
-      if (stepResult.isComplete) {
-        await this.contextManager.addMessage({
-          role: "assistant",
-          content: stepResult.answer,
-        });
-
-        const isCancelled = stepResult.cancelled === true;
-        const result: AgentResult = {
-          success: !isCancelled,
-          finalAnswer: stepResult.answer,
-          steps: this.steps,
-          totalTokens: this.contextManager.getTotalTokens(),
-          duration: Date.now() - startTime,
-        };
-        this.emitEvent({
-          type: "complete",
-          success: result.success,
-          finalAnswer: stepResult.answer,
-          duration: result.duration,
-          totalTokens: result.totalTokens,
-        });
-        return result;
-      }
-
-      if (stepResult.needsMoreInfo) {
-        const result: AgentResult = {
-          success: false,
-          finalAnswer: stepResult.answer,
-          steps: this.steps,
-          totalTokens: this.contextManager.getTotalTokens(),
-          duration: Date.now() - startTime,
-        };
-        this.emitEvent({
-          type: "complete",
-          success: false,
-          finalAnswer: stepResult.answer,
-          duration: result.duration,
-          totalTokens: result.totalTokens,
-        });
-        return result;
-      }
-    }
-
-    const result: AgentResult = {
-      success: false,
-      finalAnswer: "已达到最大步数限制，任务未能完成。",
-      steps: this.steps,
-      totalTokens: this.contextManager.getTotalTokens(),
-      duration: Date.now() - startTime,
-    };
-    this.emitEvent({
-      type: "complete",
-      success: false,
-      finalAnswer: result.finalAnswer,
-      duration: result.duration,
-      totalTokens: result.totalTokens,
-    });
-    return result;
-  }
-
-  /**
-   * 判断是否为多步骤 Plan（两者结合）：
-   * ① PLAN 文本含 ≥2 个编号步骤（1. / 1) / 1、 等格式，按行匹配）
-   * ② 当前 step 并发动作数（actions + delegates）≥2
-   * 满足任一即视为多步骤，需用户确认。
-   */
-  private isMultiStepPlan(
-    plan: string,
-    actionCount: number,
-    delegateCount: number
-  ): boolean {
-    const numberedStepLines = plan
-      .split("\n")
-      .filter((l) => /^\s*\d+[.\)、]/.test(l)).length;
-    return numberedStepLines >= 2 || actionCount + delegateCount >= 2;
-  }
-
-  private async reactStep(
-    step: number,
-    userTask: string,
-    opts?: { signal?: AbortSignal; toolTimeoutMs?: number }
-  ): Promise<{
-    isComplete: boolean;
-    needsMoreInfo: boolean;
-    answer: string;
-    cancelled?: boolean;
-  }> {
-    const signal = opts?.signal;
-    const toolTimeoutMs = opts?.toolTimeoutMs;
-    const throwIfAborted = (): void => {
-      if (signal?.aborted) {
-        throw signal.reason instanceof Error
-          ? signal.reason
-          : new Error("Task aborted");
-      }
-    };
-    throwIfAborted();
-    const messages = this.contextManager.getActiveMessages();
-    const historyText = messages
-      .map((m) => `${m.role}: ${m.content}`)
-      .join("\n");
-
-    const summary = this.contextManager.getSummary();
-    const summaryText = summary ? `\n\n历史摘要：\n${summary}` : "";
-
-    const toolsDescription = this.toolRegistry
-      .getAll()
-      .map((t) => `- ${t.name}: ${t.description}`)
-      .join("\n");
-
+    // ── 组装 system prompt：角色 + 工作方法 + 规则 + agents 清单（工具由 SDK 发 schema） ──
     const agentsDescription = this.scheduler
       .getAllAgents()
       .map(
@@ -237,338 +124,164 @@ export class MainAgent extends EventEmitter {
       )
       .join("\n");
 
-    const prompt = `你是一个多智能体系统的主控制器，拥有全部工具并可直接执行，也可委派子智能体做独立深挖。按 ReAct 模式工作，尽量并发采集信息后统一思考。
+    const system = `你是一个多智能体系统的主控制器，拥有全部工具并可直接调用，也可通过 delegate 工具委派子智能体做独立深挖。按 ReAct 模式工作，尽量并发采集信息后统一思考。
 
 工作方法（侦察 → 分类 → 深挖，非强制状态机，按任务复杂度自主决定）：
-1. 侦察：复杂任务第一步优先并发只读采集（多个 concurrent 工具同时跑），先获取事实再判断。不要在未侦察前就凭题目字面猜类别并硬路由到某个 agent。
+1. 侦察：复杂任务第一步优先并发调用多个只读采集工具（concurrent 工具可同时调用），先获取事实再判断。不要在未侦察前就凭题目字面猜类别并硬路由到某个 agent。
 2. 分类：基于侦察观察自主归类（落进 web/pwn/reverse/crypto/misc 之一，或判断为新题）。
-3. 深挖：MainAgent 继续用合适工具深入，或并发 DELEGATE 给专家 agent；不落进预设类别的新题可 SPAWN_AGENT 自定义通用 agent 再 DELEGATE。
-简单任务（如算术、常识问答）可跳过 PLAN/ACTIONS 直接 FINAL_ANSWER。
+3. 深挖：继续用合适工具深入，或并发调用 delegate 委派给专家 agent；不落进预设类别的新题可先 spawn_agent 自定义通用 agent 再 delegate。
+简单任务（如算术、常识问答）可直接调用 final_answer 交卷。
 
-步骤 ${step}/${this.maxSteps}
-
-用户任务：${userTask}
-
-可用工具（可直接调用，鼓励并发只读采集）：
-${toolsDescription}
-
-可用子智能体（适合需独立多步深挖、或输出较大的子任务）：
+可用子智能体（适合需独立多步深挖、或输出较大的子任务；通过 delegate 工具委派）：
 ${agentsDescription}
 
-对话历史：
-${historyText}
-${summaryText}
-
-输出格式（PLAN 通常仅第一步输出；ACTIONS / SPAWN_AGENT / DELEGATE 可同时出现以并发推进）：
-PLAN: [可选：侦察目标 + 总体方案。简单任务可省略]
-THOUGHT: [思考：分析进展、决定下一步。若 DELEGATE 多个 agent，在此说明每个 agent 的子任务]
-ACTIONS:
-  - <工具名>({...参数JSON...})
-  - <工具名>({...参数JSON...})
-SPAWN_AGENT: {"id":"gen-xxx","name":"...","role":"...","systemPrompt":"...","toolNames":["t1","t2"]}
-DELEGATE: <agentId1>, <agentId2>
-FINAL_ANSWER: [任务完成时的最终答案。解题/渗透/逆向/分析类任务必须按以下结构输出，让读者能手动逐步复现：
-  Flag: <flag 值；若无写"无">
-  Writeup:
-  1. <步骤：具体操作（命令/URL/动作）+ 关键观察 + 推理依据>
-  2. <步骤...>
-  ...（覆盖从入手到拿到 flag 的完整链路，命令需可复制执行）]
-
 规则：
-- 优先并发只读采集（ACTIONS 多个只读工具同时跑），再统一思考
+- 优先并发只读采集（同时调用多个只读工具），再统一思考
 - 未侦察前不要凭题目字面猜类别并硬路由到某个 agent；先侦察再分类
-- 仅当子任务需独立多步深挖或输出较大时才 DELEGATE 给已有 agent
-- 仅当任务不落进任一预设 agent 类别、且需要独立深挖时，才 SPAWN_AGENT 自定义通用 agent（id 须唯一、toolNames 必须来自上方可用工具），随后 DELEGATE 给它
-- 工具调用格式必须为 工具名(JSON参数)
-- 解题/分析类任务的 FINAL_ANSWER 必须含 Flag + 可手动复现的逐步 Writeup（每步写清：操作、观察、推理）；简单问答可直接回答`;
+- 仅当子任务需独立多步深挖或输出较大时才 delegate 给已有 agent
+- 仅当任务不落进任一预设 agent 类别、且需要独立深挖时，才 spawn_agent 自定义通用 agent（id 须唯一、toolNames 必须来自可用工具），随后 delegate 给它
+- 解题/分析类任务的 final_answer 必须含 Flag + 可手动复现的逐步 Writeup（每步写清：操作、观察、推理）；简单问答可直接回答
+- 拿到真实结果后再调用 final_answer 交卷，不要在未拿到 flag 时就用 "Flag: 无" 交卷`;
 
-    // ── 流式输出：逐 token emit thinking delta，完成后解析完整文本 ──
-    const streamResult = streamText({
-      model,
-      prompt,
-      ...(signal ? { abortSignal: signal } : {}),
-    });
-
-    let text = "";
-    for await (const delta of streamResult.textStream) {
-      text += delta;
-      // 逐段 emit，CLI 端实时打印
-      this.emitEvent({ type: "thinking", step, delta });
+    // ── 组装 messages：ContextManager 历史 → SDK CoreMessage ──
+    const history = this.contextManager.getActiveMessages();
+    const summary = this.contextManager.getSummary();
+    const messages: ModelMessage[] = [];
+    if (summary) {
+      messages.push({ role: "system", content: `历史摘要：\n${summary}` });
     }
-    throwIfAborted();
-
-    const { thought, plan, actions, delegates, spawnAgents, finalAnswer } =
-      parseMainReactResponse(text);
-
-    if (thought) this.emitEvent({ type: "thought", step, thought });
-
-    if (finalAnswer) {
-      // ============================================================
-      // CTF 任务 final answer 前置检查：
-      //   若 finalAnswer 写了 "Flag: 无" 或没有出现可验证的 flag 格式，
-      //   且用户任务/历史中出现过 CTF 相关关键词（flag/ctf/pwn/附件/题目 等），
-      //   则不提交 final，改为把 self-reflection 观察写入上下文，
-      //   让 LLM 下一轮继续 debug 迭代（直到工具 [FLAG FOUND] 被检测到）。
-      // ============================================================
-      const guard = validateCTFFinalAnswer(finalAnswer, userTask, historyText, summary || "");
-      if (!guard.ok) {
-        // 把校验失败 + 具体的 debug 建议写进上下文，相当于强制一轮 self-reflection
-        this.steps.push({
-          step,
-          action: "FINAL_ANSWER_GUARD",
-          thought,
-          observation: guard.reason + "\n" + guard.hint,
-        });
-        await this.contextManager.addMessagesBatch([
-          { role: "assistant", content: `[计划]\n${plan || ""}\n\n[思考]\n${thought || ""}\n\n[尝试的 FINAL_ANSWER]\n${finalAnswer}\n\n[系统校验：不通过]\n${guard.reason}\n\n[请按以下调试建议继续迭代（不要 FINAL_ANSWER 交卷）]\n${guard.hint}` },
-          { role: "user", content:
-`收到。请不要直接 FINAL_ANSWER，而是基于上一轮的执行结果做下一轮迭代调试：
-1. 重新精读最近 2~3 条工具结果的末尾（特别是 bytes 尾部、[NO FLAG FOUND]、[FLAG FOUND] 行），判断上一轮 exploit 为什么没触发 win
-2. 用 pwn_run_exploit 调试：调整偏移、写入字节数、cat flag 命令、sleep 时间
-3. 有条件本地调试的，先本地确认 payload 正确性再打远程
-4. 只有当工具输出里出现明确的 [FLAG FOUND] 或 flag{xxx}/ctfhub{xxx} 完整匹配时才能 FINAL_ANSWER 交卷` },
-        ]);
-        this.emitEvent({ type: "thought", step, thought: "⚠️  Flag 校验未通过：" + guard.reason + " 继续下一轮 debug。" });
-        return { isComplete: false, needsMoreInfo: false, answer: "" };
+    for (const m of history) {
+      if (m.role === "system") {
+        messages.push({ role: "system", content: m.content });
+      } else if (m.role === "user") {
+        messages.push({ role: "user", content: m.content });
+      } else if (m.role === "assistant") {
+        messages.push({ role: "assistant", content: m.content });
       }
-
-      this.emitEvent({ type: "finalAnswer", step, answer: finalAnswer });
-      this.steps.push({
-        step,
-        action: "FINAL_ANSWER",
-        thought,
-        observation: finalAnswer,
-      });
-      return { isComplete: true, needsMoreInfo: false, answer: finalAnswer };
+      // role === "tool" 的历史消息跳过：tool_use 协议下 tool_result 由 SDK 自动管理
     }
 
-    const hasActions = actions.length > 0;
-    const hasDelegates = delegates.length > 0;
-    const hasSpawn = spawnAgents.length > 0;
-    const hasPlan = !!plan;
-
-    // 无任何可推进内容 → NO_ACTION
-    if (!hasPlan && !hasActions && !hasDelegates && !hasSpawn) {
-      this.steps.push({
-        step,
-        action: "NO_ACTION",
-        thought,
-        observation: "无法解析的响应，继续下一步",
-      });
-      await this.contextManager.addMessagesBatch([
-        { role: "assistant", content: thought || "(无有效输出)" },
-      ]);
-      return { isComplete: false, needsMoreInfo: false, answer: "" };
+    // ── 组装 tools：注册表工具 + 内置控制工具 ──
+    const toolExecutor = this.toolExecutor;
+    if (!toolExecutor) {
+      throw new Error("MainAgent 缺少 ToolExecutor，无法运行 tool_use 循环");
     }
-
-    // PLAN / 工具采集 / 子智能体委派可同时推进，结果统一落库供下一步思考
-    const observations: Array<Omit<Message, "timestamp" | "tokenCount">> = [];
-
-    // 记录 PLAN（若有），写入上下文供后续步骤参考策略
-    if (hasPlan) {
-      const isMultiStep = this.isMultiStepPlan(
-        plan,
-        actions.length,
-        delegates.length
-      );
-      this.emitEvent({ type: "plan", step, plan, isMultiStep });
-
-      // 多步骤 Plan 门控：等待用户确认后再执行
-      if (isMultiStep && this.confirmPlanFn) {
-        const confirmed = await this.confirmPlanFn(plan, step);
-        this.emitEvent({ type: "planConfirmed", step, confirmed });
-        if (!confirmed) {
-          this.steps.push({
-            step,
-            action: "PLAN_CANCELLED",
-            thought,
-            observation: "用户取消执行计划",
-            plan,
-          });
-          await this.contextManager.addMessagesBatch([
-            { role: "assistant", content: `[PLAN 取消] ${plan}` },
-          ]);
-          return {
-            isComplete: true,
-            needsMoreInfo: false,
-            answer: "用户已取消该计划。",
-            cancelled: true,
-          };
-        }
-      }
-
-      this.steps.push({
-        step,
-        action: "PLAN",
-        thought,
-        observation: plan,
-        plan,
-      });
-      observations.push({ role: "assistant", content: `[PLAN] ${plan}` });
-    }
-
-    // 先注册动态 agent（若有），使其本轮即可被 DELEGATE
-    // 注册失败记为观察，不阻断其余 actions/delegates
-    if (hasSpawn) {
-      for (const sp of spawnAgents) {
-        try {
-          this.scheduler.registerDynamicAgent(sp);
-          this.emitEvent({
-            type: "spawnAgent",
-            step,
-            config: sp,
-            success: true,
-          });
-          this.steps.push({
-            step,
-            action: `SPAWN_AGENT → ${sp.id}`,
-            thought,
-            observation: `role=${sp.role}, tools=${sp.toolNames.join(", ")}`,
-          });
-        } catch (err: any) {
-          this.emitEvent({
-            type: "spawnAgent",
-            step,
-            config: sp,
-            success: false,
-            message: err.message,
-          });
-          this.steps.push({
-            step,
-            action: `SPAWN_AGENT → ${sp.id}`,
-            thought,
-            observation: `[注册失败] ${err.message}`,
-          });
-          observations.push({
-            role: "assistant",
-            content: `[动态注册失败] ${sp.id}: ${err.message}`,
-          });
-        }
-      }
-    }
-
-    if (hasActions) this.emitEvent({ type: "actionStart", step, actions });
-    if (hasDelegates)
-      this.emitEvent({ type: "delegateStart", step, agents: delegates });
-
-    const actionTask: Promise<ActionResult[]> = hasActions
-      ? this.toolExecutor
-        ? this.toolExecutor.executeBatch(actions, { signal, toolTimeoutMs })
-        : this.fallbackExecuteBatch(actions, { signal })
-      : Promise.resolve<ActionResult[]>([]);
-    const delegateTask: Promise<DispatchResult[]> = hasDelegates
-      ? this.scheduler.dispatchConcurrent(
-          delegates.map((agentId) => ({
-            agentId,
-            task: this.buildDelegateTask(thought, userTask),
-          }))
-        )
-      : Promise.resolve<DispatchResult[]>([]);
-
-    // 包装取消：signal 触发时立即 reject，避免 Promise.all 永久挂住
-    const withCancel = async <T>(p: Promise<T>): Promise<T> => {
-      if (!signal) return p;
-      if (signal.aborted) {
-        throw signal.reason instanceof Error ? signal.reason : new Error("Task aborted");
-      }
-      let rejectOnAbort: (e: Error) => void = () => {};
-      const abortP = new Promise<never>((_, rej) => {
-        rejectOnAbort = (e) => rej(e);
-      });
-      const onAbort = () => {
-        rejectOnAbort(
-          signal!.reason instanceof Error
-            ? (signal!.reason as Error)
-            : new Error("Task aborted")
-        );
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      try {
-        return await Promise.race([p, abortP]);
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-      }
+    const execFn = async (action: {
+      toolName: string;
+      toolArgs: Record<string, any>;
+    }): Promise<string> => {
+      const r = await toolExecutor.executeOne(action, { signal, toolTimeoutMs });
+      return r.result;
     };
+    const registryTools = this.toolRegistry.toAISDKTools(execFn);
 
-    const [actionResults, delegateResults] = await Promise.all([
-      withCancel(actionTask),
-      withCancel(delegateTask),
-    ]);
-    throwIfAborted();
+    // CTF 校验器（闭包捕获 userTask/history/summary）
+    const validator = (answer: string) =>
+      validateCTFFinalAnswer(answer, userTask, history.map((m) => `${m.role}: ${m.content}`).join("\n"), summary);
 
-    if (hasActions)
-      this.emitEvent({ type: "actionEnd", step, results: actionResults });
-    if (hasDelegates)
-      this.emitEvent({
-        type: "delegateEnd",
-        step,
-        results: delegateResults,
+    const builtinTools = createBuiltinTools(
+      {
+        scheduler: this.scheduler,
+        toolExecutor,
+        confirmDelegate: this.confirmPlanFn
+          ? async (_agentId: string, _task: string) =>
+              this.confirmPlanFn ? this.confirmPlanFn(_task, currentStep) : true
+          : undefined,
+      },
+      validator,
+      (ev) => this.emitEvent(ev),
+      currentStep,
+    );
+
+    const allTools = { ...registryTools, ...builtinTools };
+
+    // ── step 计数（onStepEnd 递增，供事件与 validator 引用） ──
+    const maxStepCount = this.maxSteps;
+
+    this.emitEvent({ type: "stepStart", step: 1, maxSteps: maxStepCount });
+
+    try {
+      const streamResult = streamText({
+        model,
+        system,
+        messages,
+        tools: allTools,
+        stopWhen: [hasToolCall("final_answer"), isStepCount(maxStepCount)],
+        ...(signal ? { abortSignal: signal } : {}),
+        onStepEnd: () => {
+          currentStep += 1;
+          this.emitEvent({ type: "stepEnd", step: currentStep });
+          if (currentStep < maxStepCount) {
+            this.emitEvent({ type: "stepStart", step: currentStep + 1, maxSteps: maxStepCount });
+          }
+        },
       });
 
-    for (const r of actionResults) {
-      this.steps.push({
-        step,
-        action: `TOOL: ${r.toolName}(${JSON.stringify(r.toolArgs)})`,
-        thought,
-        observation: r.result,
-      });
-      observations.push({
-        role: "tool",
-        content: `[${r.toolName}] ${JSON.stringify(r.toolArgs)} → ${r.result}`,
-      });
-    }
-    for (const d of delegateResults) {
-      this.steps.push({
-        step,
-        action: `DELEGATE → ${d.agentId}`,
-        thought,
-        observation: d.result,
-        agentId: d.agentId,
-      });
-      observations.push({
+      // 流式思考文本：逐 delta emit（CLI/VSCode 渲染层零改动）
+      for await (const delta of streamResult.textStream) {
+        throwIfAborted();
+        this.emitEvent({ type: "thinking", step: currentStep + 1, delta });
+      }
+
+      throwIfAborted();
+
+      // 等待流结束（确保所有 toolCall 执行完毕）
+      await streamResult;
+
+      // 取最终答案：优先从 final_answer toolCall 的 input.answer 取
+      // AI SDK v7 的 toolCall 用 input（已解析对象），非 args
+      const toolCalls = (await streamResult.toolCalls) || [];
+      const finalCall = toolCalls.find((tc: any) => tc.toolName === "final_answer");
+      if (finalCall && (finalCall as any).input?.answer) {
+        finalAnswer = (finalCall as any).input.answer;
+      } else {
+        // 兜底：用模型文本输出
+        finalAnswer = (await streamResult.text) || "";
+      }
+
+      await this.contextManager.addMessage({
         role: "assistant",
-        content: `[调度给 ${d.agentId}] ${thought} → ${d.result}`,
+        content: finalAnswer,
       });
+
+      const totalTokens = this.contextManager.getTotalTokens();
+      const result: AgentResult = {
+        success: Boolean(finalCall),
+        finalAnswer,
+        steps: this.steps,
+        totalTokens,
+        duration: Date.now() - startTime,
+      };
+      this.emitEvent({
+        type: "complete",
+        success: result.success,
+        finalAnswer,
+        duration: result.duration,
+        totalTokens,
+      });
+      return result;
+    } catch (err: any) {
+      // 取消/中断：返回部分结果
+      const isAbort =
+        err?.name === "AbortError" || /\b(abort|中断)\b/i.test(err?.message || "");
+      const totalTokens = this.contextManager.getTotalTokens();
+      const result: AgentResult = {
+        success: false,
+        finalAnswer: finalAnswer || (isAbort ? "任务已中断。" : `执行出错: ${err?.message || err}`),
+        steps: this.steps,
+        totalTokens,
+        duration: Date.now() - startTime,
+      };
+      this.emitEvent({
+        type: "complete",
+        success: false,
+        finalAnswer: result.finalAnswer,
+        duration: result.duration,
+        totalTokens,
+      });
+      if (isAbort) return result;
+      throw err;
     }
-
-    await this.contextManager.addMessagesBatch(observations);
-    return { isComplete: false, needsMoreInfo: false, answer: "" };
-  }
-
-  /** toolExecutor 缺失时的回退执行（串行） */
-  private async fallbackExecuteBatch(
-    actions: PlannedAction[],
-    opts?: { signal?: AbortSignal }
-  ): Promise<ActionResult[]> {
-    const signal = opts?.signal;
-    const results: ActionResult[] = [];
-    for (const a of actions) {
-      if (signal?.aborted) {
-        throw signal.reason instanceof Error ? signal.reason : new Error("Task aborted");
-      }
-      try {
-        const result = await this.toolRegistry.execute(a.toolName, a.toolArgs);
-        results.push({
-          toolName: a.toolName,
-          toolArgs: a.toolArgs,
-          success: true,
-          result,
-        });
-      } catch (err: any) {
-        results.push({
-          toolName: a.toolName,
-          toolArgs: a.toolArgs,
-          success: false,
-          result: `工具执行失败: ${err.message}`,
-        });
-      }
-    }
-    return results;
-  }
-
-  /** 构造给子智能体的任务（含主控思考与原始任务上下文） */
-  private buildDelegateTask(thought: string, userTask: string): string {
-    return `${thought}\n\n[原始任务上下文] ${userTask}`;
   }
 }
 

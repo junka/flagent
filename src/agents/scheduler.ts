@@ -2,7 +2,8 @@ import { SubAgent } from "./sub-agent";
 import { ToolRegistry } from "../tools/registry";
 import { ToolExecutor } from "./tool-executor";
 import { ContextManager } from "../context/context-manager";
-import { generateText } from "ai";
+import { generateText, tool } from "ai";
+import { z } from "zod";
 import { model } from "../llm/client";
 
 export interface SchedulerDecision {
@@ -169,26 +170,40 @@ export class Scheduler {
       .map((h) => `- 任务"${h.task.slice(0, 50)}..." → ${h.agentId} (原因: ${h.decision})`)
       .join("\n");
 
-    const prompt = `你是一个智能体调度器。请根据任务描述，选择最合适的子智能体来执行。
-
-可用子智能体列表：
-${agentList}
-
-调度历史（最近5条）：
-${routingHistoryText || "（无）"}
-
-当前任务：${task}
-
-请选择最合适的子智能体。输出格式：
-AGENT_ID: [选择的智能体ID]
-REASON: [选择原因]`;
-
-    const { text } = await generateText({
-      model,
-      prompt,
-    });
-
-    const decision = this.parseDecision(text, task);
+    // 用 tool_use 取代文本协议的 AGENT_ID/REASON 解析
+    let decision: SchedulerDecision;
+    try {
+      const selectDef: any = {
+        description: "选择一个子智能体执行任务",
+        parameters: z.object({
+          agentId: z.string().describe("选择的子智能体 id"),
+          reason: z.string().describe("选择原因"),
+        }),
+        execute: async (args: { agentId: string; reason: string }) => {
+          return `已选择 ${args.agentId}: ${args.reason}`;
+        },
+      };
+      const result = await generateText({
+        model,
+        system: `你是一个智能体调度器。根据任务描述，调用 select_agent 工具选择最合适的子智能体来执行。\n\n可用子智能体列表：\n${agentList}\n\n调度历史（最近5条）：\n${routingHistoryText || "（无）"}\n\n当前任务：${task}`,
+        messages: [{ role: "user", content: task }],
+        tools: { select_agent: tool(selectDef) },
+        toolChoice: "required",
+      });
+      const call = (result.toolCalls[0] as any) || undefined;
+      const args: any = call?.args || {};
+      decision = {
+        agentId: args.agentId || agents[0].id,
+        task,
+        reason: args.reason || "无说明",
+      };
+    } catch {
+      decision = {
+        agentId: agents[0].id,
+        task,
+        reason: "调度失败，回退到默认智能体",
+      };
+    }
 
     this.routingHistory.push({
       task,
@@ -254,31 +269,5 @@ REASON: [选择原因]`;
         }
       })
     );
-  }
-
-  private parseDecision(text: string, task: string): SchedulerDecision {
-    const lines = text.split("\n");
-    let agentId = "";
-    let reason = "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("AGENT_ID:") || trimmed.startsWith("AGENT_ID：")) {
-        agentId = trimmed.split(/[:：]/)[1].trim();
-      } else if (trimmed.startsWith("REASON:") || trimmed.startsWith("REASON：")) {
-        reason = trimmed.split(/[:：]/)[1].trim();
-      }
-    }
-
-    if (!agentId) {
-      const firstAgent = this.getAllAgents()[0];
-      return {
-        agentId: firstAgent.id,
-        task,
-        reason: "无法解析调度决策，使用默认智能体",
-      };
-    }
-
-    return { agentId, task, reason: reason || "无说明" };
   }
 }

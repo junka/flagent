@@ -1,8 +1,8 @@
 import { ContextManager } from "../context/context-manager";
 import { ToolRegistry } from "../tools/registry";
 import { ToolExecutor } from "./tool-executor";
-import { parseReactResponse, parseToolCallLine } from "./react-parser";
-import { generateText } from "ai";
+import { generateText, hasToolCall, isStepCount, type ModelMessage, tool } from "ai";
+import { z } from "zod";
 import { model } from "../llm/client";
 
 export interface SubAgentConfig {
@@ -51,138 +51,114 @@ export class SubAgent {
     return Array.from(set);
   }
 
-  /** 某工具是否属于跨类白名单（仅白名单且不在主工具内） */
-  private isCrossCategory(name: string): boolean {
-    return !this.toolNames.includes(name) && this.crossCategoryToolNames.includes(name);
-  }
-
   /**
-   * 真实 ReAct 循环：思考→行动→观察，直至 FINAL_ANSWER 或达到 maxSteps。
-   * 子 agent 仅支持单工具 ACTION（并发采集交给 MainAgent 统一调度）。
-   * 使用自身独立 context，无共享竞态。
+   * tool_use 循环：generateText + tools + stopWhen。SDK 自动驱动
+   * 思考→工具调用→观察→再思考，直到 final_answer 或达到 maxSteps。
+   * 子 agent 用自身独立 context，无共享竞态。
    */
   async run(task: string): Promise<string> {
     await this.contextManager.addMessage({ role: "user", content: task });
 
-    let lastObservation = "";
-
-    for (let step = 1; step <= this.maxSteps; step++) {
-      const prompt = this.buildPrompt(task, step);
-      const { text } = await generateText({ model, prompt });
-      const { thought, action, finalAnswer } = parseReactResponse(text);
-
-      if (finalAnswer) {
-        await this.contextManager.addMessage({
-          role: "assistant",
-          content: finalAnswer,
-        });
-        return finalAnswer;
-      }
-
-      if (action) {
-        const { toolName, toolArgs } = parseToolCallLine(action);
-        if (toolName) {
-          const obs = await this.executeScoped(toolName, toolArgs);
-          lastObservation = obs;
-          await this.contextManager.addMessage({
-            role: "tool",
-            content: `[${toolName}] ${JSON.stringify(toolArgs)} → ${obs}`,
-          });
-          continue;
-        }
-      }
-
-      // NO_ACTION：记录思考继续下一步
-      lastObservation = thought || "(无有效输出)";
-      await this.contextManager.addMessage({
-        role: "assistant",
-        content: thought || "(无有效输出)",
-      });
-    }
-
-    // 超步：返回最后观察
-    return lastObservation || "子智能体达到最大步数，未能给出最终答案。";
-  }
-
-  /** 仅允许调用本专家工具集内的工具（主清单 + 跨类白名单）；越权拒绝并给出委派建议 */
-  private async executeScoped(
-    toolName: string,
-    toolArgs: Record<string, any>
-  ): Promise<string> {
-    const allowed = this.getAllowedToolNames();
-    if (!allowed.includes(toolName)) {
-      return [
-        `[工具越权] ${toolName} 不在本专家工具集内。`,
-        `主工具可用: ${this.toolNames.join(", ")}`,
-        this.crossCategoryToolNames.length ? `跨类放行（请优先选择合适的 peer agent）：${this.crossCategoryToolNames.join(", ")}` : ``,
-        `提示：如该问题明显属于另一类题型，请通过 MainAgent DELEGATE 委派给更合适的 peer agent（web/pwn/reverse/crypto/misc/forensics/mobile/blockchain/osint/cloud/iot/aiml/linux?database）。`,
-      ].filter(Boolean).join("\n");
-    }
-    const crossHint = this.isCrossCategory(toolName)
-      ? ` [⚠️ 跨类工具调用：${this.name} 为 ${this.role}，若非核心任务请下次委派更合适的 peer agent]`
+    // 组装 system prompt（工具由 SDK 发 schema，不再拼工具描述）
+    const crossDesc = this.crossCategoryToolNames.length
+      ? `\n跨类可选工具（灵活调用但请优先委派 peer agent，避免任务跑偏）：${this.crossCategoryToolNames.join(", ")}\n`
       : "";
-    if (this.toolExecutor) {
-      const [r] = await this.toolExecutor.executeBatch([{ toolName, toolArgs }]);
-      return crossHint + r.result;
-    }
-    try {
-      return crossHint + (await this.toolRegistry.execute(toolName, toolArgs));
-    } catch (err: any) {
-      return crossHint + `工具执行失败: ${err.message}`;
-    }
-  }
+    const system = `${this.systemPrompt}
 
-  private buildPrompt(task: string, step: number): string {
-    const tools = this.toolNames
-      .map((n) => this.toolRegistry.get(n))
-      .filter(Boolean);
-    const toolsDescription = tools
-      .map((t) => `- ${t!.name}: ${t!.description}`)
-      .join("\n");
-    const crossDesc = this.crossCategoryToolNames
-      .map((n) => this.toolRegistry.get(n))
-      .filter(Boolean)
-      .map(
-        (t) =>
-          `  ⚠️ [跨类] ${t!.name}: ${t!.description}（非必要不调用，请优先委派对应的 peer agent）`
-      )
-      .join("\n");
-    const messages = this.contextManager.getActiveMessages();
-    const historyText = messages
-      .map((m) => `${m.role}: ${m.content}`)
-      .join("\n");
-    const summary = this.contextManager.getSummary();
-    const summaryText = summary ? `\n\n历史摘要：\n${summary}` : "";
-    const crossBlock = crossDesc
-      ? `\n跨类可选工具（灵活调用但请优先委派 peer agent，避免任务跑偏）：\n${crossDesc}\n`
-      : "";
-
-    return `${this.systemPrompt}
-
-你是一个${this.role}。请按照 ReAct（思考-行动-观察）模式工作，每一步只调用一个工具。
-
-步骤 ${step}/${this.maxSteps}
-
-当前任务：${task}
-
-可用工具：
-${toolsDescription}
-${crossBlock}
-对话历史：
-${historyText}
-${summaryText}
-
-请严格按照以下格式输出（只输出一段）：
-THOUGHT: [分析当前进展，决定下一步]
-ACTION: <工具名>({...参数JSON...})
-  或
-FINAL_ANSWER: [任务完成或无需工具时的最终结论]
-
+你是一个${this.role}。按 ReAct（思考-行动-观察）模式工作，调用工具获取信息后继续推理，直到任务完成调用 final_answer 交卷。
+${crossDesc}
 注意：
-- ACTION 行格式必须为 工具名(JSON参数)，例如 http_request({"url":"http://example.com"})
-- 优先使用上方 "可用工具"（本专家专属）；只有当跨类工具与任务强相关时才调用
-- 如果题目主要属于另一 CTF 题型，返回 FINAL_ANSWER 并在结论中明确建议 MainAgent 委派给合适的 peer agent
-- 参数 JSON 必须合法`;
+- 优先使用本专家专属工具；只有当跨类工具与任务强相关时才调用
+- 如果题目主要属于另一 CTF 题型，调用 final_answer 并在结论中明确建议 MainAgent 委派给合适的 peer agent`;
+
+    // 组装 messages
+    const history = this.contextManager.getActiveMessages();
+    const summary = this.contextManager.getSummary();
+    const messages: ModelMessage[] = [];
+    if (summary) messages.push({ role: "system", content: `历史摘要：\n${summary}` });
+    for (const m of history) {
+      if (m.role === "system") messages.push({ role: "system", content: m.content });
+      else if (m.role === "user") messages.push({ role: "user", content: m.content });
+      else if (m.role === "assistant") messages.push({ role: "assistant", content: m.content });
+    }
+
+    // 组装 tools：本专家工具集（含越权隔离）
+    const allowed = this.getAllowedToolNames();
+    const toolExecutor = this.toolExecutor;
+    const execFn = async (action: {
+      toolName: string;
+      toolArgs: Record<string, any>;
+    }): Promise<string> => {
+      if (!allowed.includes(action.toolName)) {
+        return [
+          `[工具越权] ${action.toolName} 不在本专家工具集内。`,
+          `主工具可用: ${this.toolNames.join(", ")}`,
+          this.crossCategoryToolNames.length
+            ? `跨类放行：${this.crossCategoryToolNames.join(", ")}`
+            : ``,
+          `提示：如该问题明显属于另一类题型，请通过 final_answer 返回结论并建议 MainAgent 委派给更合适的 peer agent。`,
+        ].filter(Boolean).join("\n");
+      }
+      const crossHint = this.isCrossCategory(action.toolName)
+        ? ` [⚠️ 跨类工具调用：${this.name} 为 ${this.role}，若非核心任务请下次委派更合适的 peer agent]`
+        : "";
+      if (toolExecutor) {
+        const r = await toolExecutor.executeOne(action);
+        return crossHint + r.result;
+      }
+      try {
+        return crossHint + (await this.toolRegistry.execute(action.toolName, action.toolArgs));
+      } catch (err: any) {
+        return crossHint + `工具执行失败: ${err.message}`;
+      }
+    };
+    const registryTools = this.toolRegistry.toAISDKTools(execFn, allowed);
+
+    // 子 agent 专用 final_answer（无 CTF 校验，直接结束）
+    let subFinalAnswer = "";
+    const finalAnswerDef: any = {
+      description: "提交子任务的最终结论并结束。若题目属于另一题型，在结论中说明并建议委派 peer agent。",
+      parameters: z.object({
+        answer: z.string().describe("子任务最终结论"),
+      }),
+      execute: async (args: { answer: string }) => {
+        subFinalAnswer = args.answer;
+        return `[子任务完成] ${args.answer}`;
+      },
+    };
+    const allTools = { ...registryTools, final_answer: tool(finalAnswerDef) };
+
+    try {
+      const result = await generateText({
+        model,
+        system,
+        messages,
+        tools: allTools,
+        stopWhen: [hasToolCall("final_answer"), isStepCount(this.maxSteps)],
+      });
+
+      // 优先从 final_answer toolCall 取（AI SDK v7 用 input，非 args）
+      const finalCall = result.toolCalls.find(
+        (tc: any) => tc.toolName === "final_answer",
+      );
+      const answer =
+        (finalCall && (finalCall as any).input?.answer) ||
+        subFinalAnswer ||
+        result.text ||
+        "子智能体达到最大步数，未能给出最终答案。";
+
+      await this.contextManager.addMessage({ role: "assistant", content: answer });
+      return answer;
+    } catch (err: any) {
+      const msg = `子智能体执行失败: ${err.message}`;
+      await this.contextManager.addMessage({ role: "assistant", content: msg });
+      return msg;
+    }
+  }
+
+  /** 某工具是否属于跨类白名单（仅白名单且不在主工具内） */
+  private isCrossCategory(name: string): boolean {
+    return !this.toolNames.includes(name) && this.crossCategoryToolNames.includes(name);
   }
 
   getContext(): ContextManager {

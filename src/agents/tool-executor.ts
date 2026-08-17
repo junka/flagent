@@ -107,6 +107,47 @@ export class ToolExecutor extends EventEmitter {
     return results;
   }
 
+  /**
+   * 执行单个工具（供 AI SDK tool_use 协议的 execute 回调调用）。
+   * 复用 runOne 的超时/取消/事件 emit，并补单工具权限检查。
+   * 返回结果字符串；权限拒绝/未找到/执行失败统一返回中文提示串（让模型据此继续推理）。
+   */
+  async executeOne(
+    action: PlannedAction,
+    opts?: { signal?: AbortSignal; toolTimeoutMs?: number }
+  ): Promise<ActionResult> {
+    // 单工具权限检查（PermissionManager 自带锁，串行化）
+    if (!this.toolRegistry.get(action.toolName)) {
+      const r: ActionResult = {
+        toolName: action.toolName,
+        toolArgs: action.toolArgs,
+        success: false,
+        result: `[工具未找到] ${action.toolName}`,
+        skipped: true,
+      };
+      return r;
+    }
+    if (
+      this.permissionManager &&
+      this.toolRegistry.requiresPermission(action.toolName)
+    ) {
+      const ok = await this.permissionManager.check(action.toolName, action.toolArgs);
+      if (!ok) {
+        const r: ActionResult = {
+          toolName: action.toolName,
+          toolArgs: action.toolArgs,
+          success: false,
+          result: `[权限拒绝] 用户未授权执行 ${action.toolName}`,
+          skipped: true,
+        };
+        this.emit("event", { type: "toolStart", action });
+        this.emit("event", { type: "toolEnd", result: r });
+        return r;
+      }
+    }
+    return this.runOne(action, opts);
+  }
+
   // 信号量限流：最多 concurrencyLimit 个任务在途
   // JS 单线程下 idx++ 是原子的（读改写之间无 await），无竞态
   private async runWithLimit(tasks: Array<() => Promise<void>>): Promise<void> {

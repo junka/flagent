@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { tool, type ToolSet } from "ai";
 
 export interface ToolDefinition {
   name: string;
@@ -72,6 +73,37 @@ export class ToolRegistry {
       description: t.description,
       parameters: this.zodToJsonSchema(t.parameters),
     }));
+  }
+
+  /**
+   * 转换为 AI SDK 原生 ToolSet，供 streamText/generateText 的 tools 参数使用。
+   * 这是迁移到 tool_use 协议的核心：把工具的 Zod schema 真正发给模型，
+   * 模型用结构化 tool_call 调用，而非文本标记解析。
+   *
+   * @param exec 单工具执行回调（由 ToolExecutor.executeOne 提供，含权限/超时/事件）
+   * @param allowedTools 白名单；未传则全部工具可用
+   */
+  toAISDKTools(
+    exec: (action: { toolName: string; toolArgs: Record<string, any> }) => Promise<string>,
+    allowedTools?: string[],
+  ): ToolSet {
+    const tools: ToolSet = {};
+    for (const t of this.getAll()) {
+      if (allowedTools && !allowedTools.includes(t.name)) continue;
+      // 跳过空描述（模型无法理解）
+      const desc = t.description || `工具 ${t.name}`;
+      // 用 as any 绕过 tool() 对 ZodTypeAny 的泛型推断（INPUT 无法从 ZodTypeAny 精确推断）
+      const def: any = {
+        description: desc,
+        parameters: t.parameters,
+        execute: async (args: Record<string, any>) => {
+          // execute 回调内调 exec → ToolExecutor.executeOne（权限/超时/事件 emit）
+          return exec({ toolName: t.name, toolArgs: args ?? {} });
+        },
+      };
+      tools[t.name] = tool(def);
+    }
+    return tools;
   }
 
   /**

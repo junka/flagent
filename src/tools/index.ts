@@ -19,4 +19,5 @@ export { createEncodingExtTools } from "./encoding-ext-tools";
 export { createCipherExtTools } from "./cipher-ext-tools";
 export { createMiscCtfTools } from "./misc-ctf-tools";
 export { createCryptoExtTools } from "./crypto-ext-tools";
+export { createRceTools } from "./rce-tools";
 export { createToolRegistry } from "./factory";

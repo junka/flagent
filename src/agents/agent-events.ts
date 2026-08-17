@@ -3,14 +3,22 @@
 
 import type { PlannedAction, ActionResult } from "./tool-executor";
 import type { DispatchResult } from "./scheduler";
-import type { SpawnAgentRequest } from "./react-parser";
 
 export {
   type PlannedAction,
   type ActionResult,
 };
 export { type DispatchResult };
-export { type SpawnAgentRequest };
+
+/** spawn_agent 动态注册子智能体的事件载荷类型。 */
+export interface SpawnAgentRequest {
+  id: string;
+  name: string;
+  role: string;
+  systemPrompt: string;
+  toolNames: string[];
+  maxSteps?: number;
+}
 
 export type AgentEvent =
   | { type: "stepStart"; step: number; maxSteps: number }

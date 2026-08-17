@@ -328,9 +328,77 @@ export class FlagentExtension {
     if (!mgr || this.running) return;
     await this.ensureApiKey();
     this.running = true;
-    this.postToWebview({ type: "status", content: "正在思考..." });
+    this.webviewThinkingBuf = ""; // 重置思考缓冲
+    this.webviewPollTimer = null;
+    this.postToWebview({ type: "status", content: "思考中" });
+    // 流式 onEvent：思考 delta 累积缓冲、阶段事件驱动 spinner 文案
+    const onEvent = (ev: import("../agents/agent-events").AgentEvent): void => {
+      switch (ev.type) {
+        case "stepStart":
+          this.flushWebviewThinking();
+          this.postToWebview({ type: "status", content: `思考中 (Step ${ev.step}/${ev.maxSteps})` });
+          break;
+        case "thinking":
+          this.webviewThinkingBuf += ev.delta;
+          this.scheduleWebviewThinkingFlush();
+          break;
+        case "thought":
+          this.flushWebviewThinking();
+          this.postToWebview({ type: "thought", content: ev.thought });
+          break;
+        case "plan":
+          this.flushWebviewThinking();
+          this.postToWebview({ type: "status", content: ev.isMultiStep ? "计划待确认" : "执行计划" });
+          this.postToWebview({ type: "plan", content: ev.plan, isMultiStep: ev.isMultiStep });
+          break;
+        case "actionStart":
+          this.flushWebviewThinking();
+          this.postToWebview({ type: "actionStart", tools: ev.actions.map((a) => a.toolName) });
+          break;
+        case "toolStart":
+          this.postToWebview({ type: "status", content: `执行工具: ${ev.action.toolName}` });
+          break;
+        case "toolEnd":
+          this.postToWebview({
+            type: "toolEnd",
+            tool: ev.result.toolName,
+            success: ev.result.success,
+            result: ev.result.result,
+          });
+          break;
+        case "delegateStart":
+          this.postToWebview({ type: "status", content: `委派子智能体: ${ev.agents.join(", ")}` });
+          break;
+        case "finalAnswer":
+          this.flushWebviewThinking();
+          this.postToWebview({ type: "finalAnswer", content: ev.answer });
+          break;
+        case "complete":
+          this.flushWebviewThinking();
+          this.postToWebview({
+            type: "complete",
+            success: ev.success,
+            duration: ev.duration,
+            totalTokens: ev.totalTokens,
+          });
+          break;
+      }
+    };
+    /** 超长任务：释放发送按钮、提示转后台、轮询 onEvent 继续推进（run 仍在 await）。 */
+    const onLongTask = (): void => {
+      this.postToWebview({
+        type: "status",
+        content: "⏱️ 任务超 2 分钟，转入后台继续运行…",
+        background: true,
+      });
+      this.running = false; // 释放发送按钮，用户可发新消息
+    };
     try {
-      const result = await mgr.run(content);
+      const result = await mgr.run(content, {
+        onEvent,
+        longTaskThresholdMs: 2 * 60 * 1000,
+        onLongTask,
+      });
       this.postToWebview({
         type: "response",
         content: result.finalAnswer,
@@ -345,7 +413,35 @@ export class FlagentExtension {
     } catch (error: any) {
       this.postToWebview({ type: "error", content: error.message });
     } finally {
+      this.flushWebviewThinking();
+      if (this.webviewPollTimer) {
+        clearInterval(this.webviewPollTimer);
+        this.webviewPollTimer = null;
+      }
       this.running = false;
+    }
+  }
+
+  // ── Webview 思考流节流缓冲：按 1s 批量 flush thinking delta ──
+  private webviewThinkingBuf = "";
+  private webviewFlushTimer: ReturnType<typeof setInterval> | null = null;
+  private webviewPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** 启动 1s 定时器批量 flush 思考缓冲（首块不立即发，避免高频 postMessage）。 */
+  private scheduleWebviewThinkingFlush(): void {
+    if (this.webviewFlushTimer) return;
+    this.webviewFlushTimer = setInterval(() => this.flushWebviewThinking(), 1000);
+  }
+
+  /** 强制 flush 残余思考文本并停定时器。 */
+  private flushWebviewThinking(): void {
+    if (this.webviewFlushTimer) {
+      clearInterval(this.webviewFlushTimer);
+      this.webviewFlushTimer = null;
+    }
+    if (this.webviewThinkingBuf) {
+      this.postToWebview({ type: "thinking", delta: this.webviewThinkingBuf });
+      this.webviewThinkingBuf = "";
     }
   }
 
@@ -534,6 +630,14 @@ export class FlagentExtension {
   button:disabled { opacity: 0.5; cursor: default; }
   button:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
   .stats { font-size: 0.8em; color: var(--vscode-descriptionForeground); margin: 4px 0 10px; padding-top: 6px; border-top: 1px dashed var(--vscode-editorWidget-border); }
+  .thinking-block { margin: 6px 0; padding: 8px 11px; border-radius: 6px; background: var(--vscode-editorWidget-background); border-left: 3px solid var(--vscode-textLink-foreground); }
+  .thinking-block .label { font-size: 0.8em; color: var(--vscode-textLink-foreground); margin-bottom: 4px; }
+  .thinking-block pre { margin: 0; white-space: pre-wrap; word-wrap: break-word; font-family: inherit; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+  .spinner { display: inline-block; margin-left: 4px; }
+  .spinner span { display: inline-block; animation: bounce 1.2s infinite; opacity: 0.4; }
+  .spinner span:nth-child(2) { animation-delay: 0.2s; }
+  .spinner span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes bounce { 0%,100%{opacity:0.3; transform: translateY(0)} 50%{opacity:1; transform: translateY(-2px)} }
   .loading { display: inline-block; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 </style>
@@ -553,6 +657,8 @@ export class FlagentExtension {
   const sendBtn = document.getElementById('sendBtn');
   const header = document.getElementById('header');
   let thinkingEl = null;
+  let thinkingPre = null;       // 思考流增量追加的目标 <pre>
+  let thinkingLabel = null;     // 思考区标签（含 spinner）
 
   function addMessage(text, type) {
     const div = document.createElement('div');
@@ -562,15 +668,44 @@ export class FlagentExtension {
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
     return div;
   }
-  function clearThinking() { if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; } }
+  function clearThinking() {
+    if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; thinkingPre = null; thinkingLabel = null; }
+  }
+  /** 显示带旋转点动画的状态条，text 为阶段文案（思考中/执行工具…）。 */
   function showThinking(text) {
     clearThinking();
-    thinkingEl = addMessage(text + ' \\u27f3', 'system');
-    thinkingEl.innerHTML = text + ' <span class="loading">\\u27f3</span>';
+    thinkingEl = document.createElement('div');
+    thinkingEl.className = 'message system';
+    thinkingLabel = document.createElement('span');
+    thinkingLabel.innerHTML = text + ' <span class="spinner"><span>•</span><span>•</span><span>•</span></span>';
+    thinkingEl.appendChild(thinkingLabel);
+    messagesDiv.appendChild(thinkingEl);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  }
+  /** 更新状态条文案，保留 spinner。 */
+  function updateThinking(text) {
+    if (thinkingLabel) thinkingLabel.innerHTML = text + ' <span class="spinner"><span>•</span><span>•</span><span>•</span></span>';
+  }
+  /** 追加思考流增量到思考块（无 spinner，纯文本流式）。 */
+  function appendThinking(delta) {
+    if (!thinkingEl || thinkingEl.className.indexOf('thinking-block') < 0) {
+      clearThinking();
+      thinkingEl = document.createElement('div');
+      thinkingEl.className = 'thinking-block';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = '💭 思考';
+      thinkingPre = document.createElement('pre');
+      thinkingEl.appendChild(label);
+      thinkingEl.appendChild(thinkingPre);
+      messagesDiv.appendChild(thinkingEl);
+    }
+    if (thinkingPre) thinkingPre.textContent += delta;
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
   }
   function renderHistory(messages, title) {
     messagesDiv.innerHTML = '';
-    thinkingEl = null;
+    thinkingEl = null; thinkingPre = null; thinkingLabel = null;
     header.textContent = title ? ('会话：' + title) : 'Flagent 多智能体系统';
     if (!messages || messages.length === 0) {
       addMessage('Flagent 多智能体系统已就绪。输入问题开始对话，或在侧边栏切换/新建会话。', 'system');
@@ -587,7 +722,7 @@ export class FlagentExtension {
     if (!text) return;
     addMessage(text, 'user');
     input.value = '';
-    showThinking('正在思考...');
+    showThinking('思考中');
     sendBtn.disabled = true;
     vscode.postMessage({ type: 'query', content: text });
   }
@@ -600,7 +735,42 @@ export class FlagentExtension {
     if (message.type === 'history') {
       renderHistory(message.messages, message.title);
     } else if (message.type === 'status') {
-      showThinking(message.content);
+      // 阶段状态：思考中 / 执行工具 / 委派…（保留或新建状态条）
+      if (thinkingEl && thinkingEl.className.indexOf('thinking-block') < 0) {
+        updateThinking(message.content);
+      } else {
+        showThinking(message.content);
+      }
+    } else if (message.type === 'thinking') {
+      // 流式思考增量（已由扩展端 1s 节流批量发送）
+      appendThinking(message.delta);
+    } else if (message.type === 'thought') {
+      // 完整思考（非流式 fallback）：直接展示
+      clearThinking();
+      const block = document.createElement('div');
+      block.className = 'thinking-block';
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = '💭 思考';
+      const pre = document.createElement('pre');
+      pre.textContent = message.content;
+      block.appendChild(label);
+      block.appendChild(pre);
+      messagesDiv.appendChild(block);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    } else if (message.type === 'plan') {
+      clearThinking();
+      addMessage('📋 Plan' + (message.isMultiStep ? '（多步骤·待确认）' : '（单步骤·直接执行）') + ':\\n' + message.content, 'system');
+    } else if (message.type === 'actionStart') {
+      showThinking('执行工具: ' + message.tools.join(', '));
+    } else if (message.type === 'toolEnd') {
+      const mark = message.success ? '✓' : '✗';
+      addMessage('  ' + mark + ' ' + message.tool + ':\\n' + message.result, 'system');
+    } else if (message.type === 'finalAnswer') {
+      // 流式期间已收到最终答案片段，追加为 assistant 消息（response 会做最终替换）
+      clearThinking();
+    } else if (message.type === 'complete') {
+      // 统计在 response 后追加；此处仅清状态
     } else if (message.type === 'response') {
       clearThinking();
       sendBtn.disabled = false;

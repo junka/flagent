@@ -28,6 +28,14 @@ export interface RunOptions {
   confirmPlan?: ConfirmPlanFn;
   /** 中断信号；触发后 mainAgent.run 与工具执行立即抛 AbortError。 */
   signal?: AbortSignal;
+  /**
+   * 超长任务阈值（毫秒）。前台 run 超过该时长仍未完成时触发 onLongTask，
+   * 由调用方决定如何释放 UI / 切换为后台轮询。默认 120000（2 分钟）。
+   * 传 0 或负数禁用。Session 只负责"通知超时"，不强制转后台语义。
+   */
+  longTaskThresholdMs?: number;
+  /** 超长任务触发回调（仅触发一次，run 结束后自动清理定时器）。 */
+  onLongTask?: () => void;
 }
 
 export interface SessionCreateInit {
@@ -145,13 +153,34 @@ export class Session {
     }
 
     try {
-      const result = await this.mainAgent.run(task, {
-        ...(options?.signal ? { signal: options.signal } : {}),
-      });
-      // MainAgent.run 每次重置自身 steps；Session 是跨 run 历史真相源，累积保留
-      this.steps = [...this.steps, ...result.steps];
-      this.updatedAt = Date.now();
-      return result;
+      // 超长任务监控：超过阈值仍未完成则通知调用方（仅一次），run 结束自动清理
+      const threshold = options?.longTaskThresholdMs ?? 120000;
+      let longTaskTimer: NodeJS.Timeout | undefined;
+      let longTaskFired = false;
+      if (threshold > 0 && options?.onLongTask) {
+        const cb = options.onLongTask;
+        longTaskTimer = setTimeout(() => {
+          if (longTaskFired) return;
+          longTaskFired = true;
+          try {
+            cb();
+          } catch {
+            /* 调用方回调异常不影响 run 本身 */
+          }
+        }, threshold);
+      }
+
+      try {
+        const result = await this.mainAgent.run(task, {
+          ...(options?.signal ? { signal: options.signal } : {}),
+        });
+        // MainAgent.run 每次重置自身 steps；Session 是跨 run 历史真相源，累积保留
+        this.steps = [...this.steps, ...result.steps];
+        this.updatedAt = Date.now();
+        return result;
+      } finally {
+        if (longTaskTimer) clearTimeout(longTaskTimer);
+      }
     } finally {
       // 清理监听，避免跨 run 累积；重置 confirmPlanFn
       if (mainHandler) this.mainAgent.off("event", mainHandler);

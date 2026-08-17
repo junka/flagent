@@ -10,6 +10,7 @@ import type { AgentEvent } from "../agents/agent-events";
 import {
   getBackgroundManager,
   type BackgroundTaskSnapshot,
+  type BackgroundManager,
 } from "../agents/background-manager";
 
 // 兼容旧 import 路径（tests 仍从 dist/cli/index 取 createAgentSystem / createToolRegistry）
@@ -228,6 +229,243 @@ function preview(text: string, max = 100): string {
   return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
 }
 
+/**
+ * 思考流节流缓冲：累积 thinking delta，按固定间隔批量 flush，避免逐 token
+ * 直接写 stdout 造成的卡顿感。首块立即 flush（让用户尽快看到开始思考），
+ * 之后每 flushIntervalMs 毫秒 flush 一次；调用 flushNow() 在流结束/切换阶段
+ * 时强制清空残余。
+ */
+class ThinkingBuffer {
+  private buf = "";
+  private timer: NodeJS.Timeout | null = null;
+  private started = false;
+  constructor(
+    private readonly writer: (text: string) => void,
+    private readonly flushIntervalMs = 1000,
+  ) {}
+
+  /** 写入一个 delta 片段。首块立即 flush，之后启动定时器。 */
+  push(delta: string): void {
+    if (!delta) return;
+    this.buf += delta;
+    if (!this.started) {
+      this.started = true;
+      this.flushNow();
+      this.timer = setInterval(() => this.flushNow(), this.flushIntervalMs);
+    }
+  }
+
+  /** 强制清空缓冲并停止定时器（流结束 / 阶段切换时调用）。 */
+  flushNow(): void {
+    if (this.buf) {
+      this.writer(this.buf);
+      this.buf = "";
+    }
+  }
+
+  /** 彻底停止：flush 残余 + 清定时器，回到未启动状态，可复用。 */
+  reset(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.flushNow();
+    this.started = false;
+  }
+}
+
+/**
+ * 终端旋转 spinner（Braille 帧），无第三方依赖。在思考/工具执行等阶段
+ * 显示动态指示，替代静态文字。与思考流输出互斥：流式 delta 开始后应 stop()。
+ */
+class Spinner {
+  private static readonly FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  private timer: NodeJS.Timeout | null = null;
+  private frameIdx = 0;
+  private prefix = "";
+  private active = false;
+
+  /** 启动 spinner，prefix 为前缀文案（如 "思考中" / "执行 http_request"）。 */
+  start(prefix: string): void {
+    if (this.active) {
+      // 已在转：仅更新文案
+      this.prefix = prefix;
+      return;
+    }
+    this.active = true;
+    this.prefix = prefix;
+    this.frameIdx = 0;
+    this.render();
+    this.timer = setInterval(() => {
+      this.frameIdx = (this.frameIdx + 1) % Spinner.FRAMES.length;
+      this.render();
+    }, 120);
+  }
+
+  /** 更新文案但不重启。 */
+  update(prefix: string): void {
+    if (this.active) this.prefix = prefix;
+  }
+
+  private render(): void {
+    const frame = Spinner.FRAMES[this.frameIdx];
+    process.stdout.write(`\r${frame} ${this.prefix}`);
+  }
+
+  /** 停止并清除当前行。 */
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    if (this.active) {
+      process.stdout.write("\r\x1b[K"); // 回到行首并清行
+    }
+    this.active = false;
+  }
+}
+
+/**
+ * 通用上下键选择器：暂停 readline 行模式，切 stdin 到 raw 模式捕获方向键，
+ * 渲染可滚动菜单，Enter 确认 / Ctrl+C 取消。支持任意数量选项，每项可带描述。
+ *
+ * 后续 Plan 门控、权限确认、多分支问题都可复用，避免逐字输入 y/n。
+ *
+ * @param title   菜单标题（单行，必填）
+ * @param options 选项数组：label 为正文，desc 为可选灰色说明
+ * @param opts    initialIdx 初始高亮项；cancelIdx 取消时返回该项索引（默认 0）
+ * @returns       选中项索引；Ctrl+C / Esc 返回 cancelIdx
+ */
+async function selectPrompt(
+  title: string,
+  options: { label: string; desc?: string }[],
+  rl: readline.Interface,
+  opts: { initialIdx?: number; cancelIdx?: number } = {},
+): Promise<number> {
+  const initialIdx = opts.initialIdx ?? 0;
+  const cancelIdx = opts.cancelIdx ?? 0;
+  if (options.length === 0) return 0;
+
+  // 非 TTY（管道/重定向）无法捕获方向键 → 退化为打印首项并返回
+  if (!process.stdin.isTTY) {
+    console.log(`\n${title}`);
+    console.log(`  (非交互环境，默认选择: ${options[initialIdx].label})`);
+    return initialIdx;
+  }
+
+  return new Promise<number>((resolve) => {
+    let idx = Math.max(0, Math.min(initialIdx, options.length - 1));
+    let settled = false;
+    let wasRaw = false;
+    // 本菜单已渲染的行数（标题+空行+各选项）。重绘时按此上移，保证回到首行。
+    let renderedLines = 0;
+
+    const finish = (val: number): void => {
+      if (settled) return;
+      settled = true;
+      process.stdin.removeListener("data", onData);
+      process.stdin.removeListener("end", onEnd);
+      // 恢复 raw 模式：仅当进入前不是 raw 时才关回行模式
+      if (!wasRaw && process.stdin.setRawMode) process.stdin.setRawMode(false);
+      process.stdin.resume();
+      // 让 readline 重新接管行模式输入
+      rl.resume();
+      // 清掉整块菜单渲染（标题+空行+选项），回到菜单首行
+      if (renderedLines > 0) {
+        process.stdout.write(`\x1b[${renderedLines}A`);
+        for (let i = 0; i < renderedLines; i++) {
+          process.stdout.write("\r\x1b[K\n");
+        }
+        // 上移回去，让光标停在菜单块首行（供调用方覆盖输出结果）
+        process.stdout.write(`\x1b[${renderedLines}A`);
+      }
+      resolve(val);
+    };
+
+    const render = (): void => {
+      // 若已渲染过，先把光标移回首行再逐行重绘（每行 \r\x1b[K 清整行，杜绝残留）
+      if (renderedLines > 0) {
+        process.stdout.write(`\x1b[${renderedLines}A`);
+      }
+      const out: string[] = [];
+      out.push(""); // 标题上方空行（与下方 label 对齐美观）
+      // title 可能含 \n（如权限确认的多行标题），按实际行数展开
+      for (const tLine of title.split("\n")) out.push(tLine);
+      options.forEach((o, i) => {
+        const arrow = i === idx ? "❯" : " ";
+        const label = i === idx ? `\x1b[36m${o.label}\x1b[0m` : o.label;
+        const desc = o.desc ? `  \x1b[2m${o.desc}\x1b[0m` : "";
+        out.push(`  ${arrow} ${label}${desc}`);
+      });
+      renderedLines = out.length;
+      for (const line of out) {
+        process.stdout.write(`\r\x1b[K${line}\n`);
+      }
+    };
+
+    const onData = (buf: Buffer): void => {
+      const s = buf.toString();
+      // 方向键以 ESC(0x1b) 起头的三字节序列
+      if (s === "\x1b[A" || s === "k") {
+        // 上
+        idx = (idx - 1 + options.length) % options.length;
+        render();
+      } else if (s === "\x1b[B" || s === "j") {
+        // 下
+        idx = (idx + 1) % options.length;
+        render();
+      } else if (s === "\r" || s === "\n") {
+        // Enter 确认
+        finish(idx);
+      } else if (s === "\x03") {
+        // Ctrl+C 取消
+        finish(cancelIdx);
+      } else if (s === "\x1b") {
+        // 单独 Esc 取消
+        finish(cancelIdx);
+      } else if (s === "y" || s === "Y") {
+        // y/n 快捷：首个 label 含"是/允许/确认"视为 yes
+        const yesIdx = options.findIndex((o) => /是|允许|确认|执行|继续/.test(o.label));
+        finish(yesIdx >= 0 ? yesIdx : 0);
+      } else if (s === "n" || s === "N") {
+        const noIdx = options.findIndex((o) => /否|拒绝|取消|停止|放弃/.test(o.label));
+        finish(noIdx >= 0 ? noIdx : options.length - 1);
+      }
+    };
+
+    const onEnd = (): void => finish(cancelIdx);
+
+    // 暂停 readline 行模式，接管 stdin
+    rl.pause();
+    // 先记录进入前的 raw 状态，再开启 raw（顺序不能反）
+    wasRaw = Boolean(process.stdin.isRaw);
+    if (process.stdin.setRawMode) process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    // 首次渲染：renderedLines=0 不上移，直接画出标题+菜单
+    render();
+
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+  });
+}
+
+/** y/n 二选一封装：返回 true=是，false=否。Ctrl+C 视为否。 */
+async function confirmYesNo(
+  title: string,
+  rl: readline.Interface,
+  yesLabel = "是，允许",
+  noLabel = "否，取消",
+  opts: { defaultYes?: boolean } = {},
+): Promise<boolean> {
+  const initialIdx = opts.defaultYes ? 0 : 1;
+  const picked = await selectPrompt(title, [
+    { label: yesLabel, desc: "Enter 确认" },
+    { label: noLabel, desc: "或 Ctrl+C" },
+  ], rl, { initialIdx, cancelIdx: 1 });
+  return picked === 0;
+}
+
 /** 把毫秒转成人读的时长。 */
 function fmtDuration(ms: number | null): string {
   if (ms == null || !isFinite(ms) || ms < 0) return "-";
@@ -319,19 +557,13 @@ export async function startCLI(): Promise<void> {
     args: Record<string, any>
   ): Promise<boolean> => {
     const argStr = JSON.stringify(args).slice(0, 200);
-    return new Promise((resolve) => {
-      rl.question(
-        `\n⚠️  权限请求: 工具 "${toolName}" 参数 ${argStr}\n    允许执行? (y/n) [本会话记忆] `,
-        (answer) => {
-          resolve(answer.trim().toLowerCase().startsWith("y"));
-        }
-      );
-    });
+    const title = `⚠️  权限请求: 工具 "${toolName}" 参数 ${argStr}\n    允许执行? [本会话记忆]`;
+    return confirmYesNo(title, rl, "是，允许执行", "否，拒绝", { defaultYes: false });
   };
 
   const toolRegistry = createToolRegistry();
   const sessionManager = new SessionManager({ toolRegistry, confirmFn });
-  let mainAgentRunning = false; // run 期间拦截新输入（权限确认的 y/n 由 rl.question 处理）
+  let mainAgentRunning = false; // run 期间：新输入被提示等待（前台优先，不自动挤转后台）
   let verbose = false; // /verbose 切换：默认精简，开启后显示完整思考与工具结果
 
   // --- Ctrl+C 交互：单次中断当前运行，快速双击退出 ---
@@ -435,8 +667,15 @@ export async function startCLI(): Promise<void> {
   rl.on("line", async (line: string) => {
     const input = line.trim();
 
-    // run 期间忽略新输入（权限确认的 y/n 由 rl.question 回调消费）
+    // 前台任务运行中：不挤转后台，提示用户等待或用 /bgstart 起独立后台任务。
+    // 理由：自动挤转会让正在思考的任务过早进后台、用户失去观察；
+    //       前台优先 + 主动 /bgstart 是更简单清晰的模型。
     if (mainAgentRunning) {
+      console.log(
+        "\n⏳ 当前任务正在前台运行中。等待完成即可继续；" +
+        "若需并行，用 /bgstart <任务> 起独立后台任务，用 /status 查看进度。\n"
+      );
+      rl.prompt();
       return;
     }
 
@@ -670,9 +909,20 @@ export async function startCLI(): Promise<void> {
 
       /** 后台事件打印：复用 verbose 策略（与前台相同的视觉）。 */
       let bgStreamingThinking = false;
+      const bgThinkingBuf = new ThinkingBuffer((text) => {
+        process.stdout.write(text);
+      });
+      const endBgThinking = (): void => {
+        bgThinkingBuf.reset();
+        if (bgStreamingThinking) {
+          process.stdout.write("\n");
+          bgStreamingThinking = false;
+        }
+      };
       const onEvent = (event: AgentEvent): void => {
         switch (event.type) {
           case "stepStart":
+            endBgThinking();
             if (verbose)
               console.log(`\n${taskBadge} ━━━ Step ${event.step}/${event.maxSteps} ━━━`);
             break;
@@ -681,11 +931,12 @@ export async function startCLI(): Promise<void> {
               bgStreamingThinking = true;
               process.stdout.write(`\n${taskBadge} 💭 `);
             }
-            process.stdout.write(event.delta);
+            bgThinkingBuf.push(event.delta);
             break;
           }
           case "thought": {
             if (bgStreamingThinking) {
+              bgThinkingBuf.flushNow();
               process.stdout.write("\n");
               bgStreamingThinking = false;
             } else if (verbose) {
@@ -698,7 +949,7 @@ export async function startCLI(): Promise<void> {
             break;
           }
           case "plan": {
-            if (bgStreamingThinking) { process.stdout.write("\n"); bgStreamingThinking = false; }
+            endBgThinking();
             const tag = event.isMultiStep ? "（多步骤·待确认）" : "（单步骤·直接执行）";
             console.log(`\n${taskBadge} 📋 Plan${tag}:`);
             console.log(indent(event.plan, "       "));
@@ -710,7 +961,7 @@ export async function startCLI(): Promise<void> {
             );
             break;
           case "actionStart":
-            if (bgStreamingThinking) { process.stdout.write("\n"); bgStreamingThinking = false; }
+            endBgThinking();
             console.log(
               `${taskBadge} 🔧 执行工具: ${event.actions
                 .map((a) => a.toolName).join(", ")}`
@@ -751,6 +1002,7 @@ export async function startCLI(): Promise<void> {
             break;
           }
           case "finalAnswer":
+            endBgThinking();
             console.log(`\n${taskBadge} ${"─".repeat(52)}`);
             console.log(`${taskBadge} ✅ 最终回答：`);
             console.log(taskBadge + " " + "─".repeat(52));
@@ -758,6 +1010,7 @@ export async function startCLI(): Promise<void> {
             console.log(taskBadge + " " + "─".repeat(52));
             break;
           case "complete": {
+            endBgThinking();
             console.log(`\n${taskBadge} 📈 执行统计：`);
             console.log(`${taskBadge}    耗时: ${(event.duration / 1000).toFixed(1)}s`);
             console.log(`${taskBadge}    Token 数: ${event.totalTokens}`);
@@ -768,24 +1021,22 @@ export async function startCLI(): Promise<void> {
           }
         }
       };
-      const confirmPlan = (_plan: string): Promise<boolean> => {
-        return new Promise((resolve) => {
-          let settled = false;
-          const finish = (val: boolean) => {
-            if (settled) return;
-            settled = true;
-            rl.removeListener("SIGINT", onSigint);
-            resolve(val);
-          };
-          const onSigint = () => {
-            console.log(`\n${taskBadge} ⏹️  已取消该计划（Ctrl+C）`);
-            finish(false);
-          };
-          rl.on("SIGINT", onSigint);
-          rl.question(`\n${taskBadge} ⏸️  多步骤 Plan，是否执行? (y/n) `, (answer) => {
-            finish(answer.trim().toLowerCase().startsWith("y"));
-          });
-        });
+      const confirmPlan = async (plan: string): Promise<boolean> => {
+        if (plan && plan.trim()) {
+          console.log(`\n${taskBadge} 📋 待确认的委派/计划：`);
+          console.log(indent(plan, taskBadge + "      "));
+        }
+        const picked = await selectPrompt(
+          `${taskBadge} ⏸️  是否执行?`,
+          [
+            { label: "执行", desc: "Enter" },
+            { label: "取消", desc: "Ctrl+C" },
+          ],
+          rl,
+          { initialIdx: 0, cancelIdx: 1 },
+        );
+        if (picked === 1) console.log(`${taskBadge} ⏹️  已取消该计划`);
+        return picked === 0;
       };
 
       try {
@@ -1035,61 +1286,96 @@ export async function startCLI(): Promise<void> {
     // 通过 onEvent 流式输出思考/工具执行过程；多步骤 Plan 经 confirmPlan 门控
     mainAgentRunning = true;
 
-    /** 流式事件渲染：thinking delta 实时打印，thought 事件不再重复 */
-    let streamingThinking = false; // 当前是否正在流式输出思考
+    // ── 流式渲染辅助：spinner 动画 + 思考流 1s 节流缓冲 ──
+    const spinner = new Spinner();
+    /** 转后台后为 true，此后所有输出加 [BG] 前缀，复用后台任务视觉。 */
+    let taskWentBackground = false;
+    /**
+     * 转后台后，前台 run 在 BackgroundManager 注册的"影子任务"句柄。
+     * 用 holder 对象包一层，避免 TS 把 let 变量在闭包赋值后收窄成 null。
+     * /status 可见、/kill 可取消（联动前台 AbortController），
+     * run 结束时由下方 try/catch 标记 COMPLETED/CRASHED。
+     */
+    const bgHandlesRef: { current: ReturnType<BackgroundManager["createTask"]> | null } = { current: null };
+    const bgBadge = () => (taskWentBackground ? " [BG]" : "");
+    /** 思考缓冲：按 ~1s 批量 flush thinking delta，避免逐 token 卡顿。 */
+    const thinkingBuf = new ThinkingBuffer((text) => {
+      // 写入前确保 spinner 已停（thinking 流与 spinner 互斥）
+      spinner.stop();
+      process.stdout.write(text);
+    });
+    /** 当前是否在流式输出思考（控制 thought 事件是否仅关闭行）。 */
+    let streamingThinking = false;
+    /** 切换阶段时强制 flush 思考缓冲并关闭思考行。 */
+    const endThinkingStream = (): void => {
+      thinkingBuf.reset();
+      if (streamingThinking) {
+        process.stdout.write("\n");
+        streamingThinking = false;
+      }
+      spinner.stop();
+    };
 
     const onEvent = (event: AgentEvent): void => {
+      // 转后台后：同步刷新影子任务心跳与 step（供 /status 显示进度）
+      if (bgHandlesRef.current) {
+        try { bgHandlesRef.current.onEvent(event); } catch {}
+      }
+      const badge = bgBadge();
       switch (event.type) {
         case "stepStart":
+          endThinkingStream();
           if (verbose)
-            console.log(`\n━━━ Step ${event.step}/${event.maxSteps} ━━━`);
+            console.log(`\n${badge} ━━━ Step ${event.step}/${event.maxSteps} ━━━`);
+          spinner.start("思考中");
           break;
 
         case "thinking": {
-          // 首个 delta → 打印行头
+          // 首个 delta → 打印行头并停止 spinner，之后通过缓冲按 1s flush
           if (!streamingThinking) {
+            spinner.stop();
             streamingThinking = true;
-            process.stdout.write("\n  💭 ");
+            process.stdout.write(`\n${badge}  💭 `);
+            // 首块立即 flush（ThinkingBuffer 首块即时机制）
           }
-          process.stdout.write(event.delta);
+          thinkingBuf.push(event.delta);
           break;
         }
 
         case "thought": {
-          // 流式已输出完整思考，只需关闭行；非流式 fallback 正常打印
+          // 流式已输出完整思考，只需 flush 残余 + 关闭行；非流式 fallback 正常打印
           if (streamingThinking) {
+            thinkingBuf.flushNow();
             process.stdout.write("\n");
             streamingThinking = false;
           } else if (verbose) {
-            console.log(`\n  💭 思考:`);
-            console.log(indent(event.thought, "     "));
+            console.log(`\n${badge}  💭 思考:`);
+            console.log(indent(event.thought, badge + "      "));
           } else {
             const head = event.thought.split("\n")[0];
-            console.log(`\n  💭 ${preview(head, 80)}`);
+            console.log(`\n${badge}  💭 ${preview(head, 80)}`);
           }
           break;
         }
 
         case "plan": {
-          if (streamingThinking) { process.stdout.write("\n"); streamingThinking = false; }
+          endThinkingStream();
           const tag = event.isMultiStep ? "（多步骤·待确认）" : "（单步骤·直接执行）";
-          console.log(`\n  📋 Plan${tag}:`);
-          console.log(indent(event.plan, "     "));
+          console.log(`\n${badge}  📋 Plan${tag}:`);
+          console.log(indent(event.plan, badge + "      "));
           break;
         }
 
         case "planConfirmed":
           console.log(
-            event.confirmed
-              ? `  ▶️  已确认，开始执行`
-              : `  ⏹️  已取消该计划`
+            badge + (event.confirmed ? "  ▶️  已确认，开始执行" : "  ⏹️  已取消该计划")
           );
           break;
 
         case "actionStart":
-          if (streamingThinking) { process.stdout.write("\n"); streamingThinking = false; }
+          endThinkingStream();
           console.log(
-            `  🔧 执行工具: ${event.actions
+            `${badge}  🔧 执行工具: ${event.actions
               .map((a) => a.toolName)
               .join(", ")}`
           );
@@ -1098,19 +1384,22 @@ export async function startCLI(): Promise<void> {
         case "toolStart":
           if (verbose)
             console.log(
-              `     → 开始 ${event.action.toolName}(${JSON.stringify(
+              `${badge}      → 开始 ${event.action.toolName}(${JSON.stringify(
                 event.action.toolArgs
               )})`
             );
+          else
+            spinner.start("执行 " + event.action.toolName);
           break;
 
         case "toolEnd": {
+          spinner.stop();
           const r = event.result;
           const mark = r.success ? "✓" : "✗";
           const skipped = r.skipped ? "（跳过）" : "";
           // 工具结果完整打印（不截断），保留原换行 + 缩进，便于人类观察关键线索
-          console.log(`     ${mark} ${r.toolName}${skipped}:`);
-          console.log(indent(r.result, "        "));
+          console.log(`${badge}      ${mark} ${r.toolName}${skipped}:`);
+          console.log(indent(r.result, badge + "         "));
           break;
         }
 
@@ -1119,80 +1408,166 @@ export async function startCLI(): Promise<void> {
           break;
 
         case "delegateStart":
-          console.log(`  🤝 委派子智能体: ${event.agents.join(", ")}`);
+          endThinkingStream();
+          console.log(`${badge}  🤝 委派子智能体: ${event.agents.join(", ")}`);
           break;
 
         case "delegateEnd":
+          spinner.stop();
           for (const d of event.results) {
             const mark = d.success ? "✓" : "✗";
-            console.log(`     ${mark} ${d.agentId}:`);
-            console.log(indent(d.result, "        "));
+            console.log(`${badge}      ${mark} ${d.agentId}:`);
+            console.log(indent(d.result, badge + "         "));
           }
           break;
 
         case "spawnAgent": {
+          spinner.stop();
           const mark = event.success ? "✓" : "✗";
           const detail = event.success
             ? `role=${event.config.role}, tools=${event.config.toolNames.join(", ")}`
             : event.message || "注册失败";
-          console.log(`     ${mark} SPAWN ${event.config.id}: ${detail}`);
+          console.log(`${badge}      ${mark} SPAWN ${event.config.id}: ${detail}`);
           break;
         }
 
         case "finalAnswer":
-          if (streamingThinking) { process.stdout.write("\n"); streamingThinking = false; }
-          console.log(`\n${"─".repeat(56)}`);
-          console.log(`✅ 最终回答：`);
-          console.log("─".repeat(56));
+          endThinkingStream();
+          console.log(`\n${badge} ${"─".repeat(56 - badge.length)}`);
+          console.log(`${badge} ✅ 最终回答：`);
+          console.log(badge + " " + "─".repeat(56 - badge.length));
           // writeup 为多行结构化内容，原样打印保留格式（避免缩进破坏编号/代码块）
           console.log(event.answer);
-          console.log("─".repeat(56));
+          console.log(badge + " " + "─".repeat(56 - badge.length));
           break;
 
         case "stepEnd":
           break;
 
         case "complete": {
-          console.log(`\n📈 执行统计：`);
-          console.log(`   耗时: ${(event.duration / 1000).toFixed(1)}s`);
-          console.log(`   Token 数: ${event.totalTokens}`);
+          endThinkingStream();
+          console.log(`\n${badge} 📈 执行统计：`);
+          console.log(`${badge}    耗时: ${(event.duration / 1000).toFixed(1)}s`);
+          console.log(`${badge}    Token 数: ${event.totalTokens}`);
           const statusLabel = event.success ? "✓ 成功" : "✗ 已取消/未完成";
-          console.log(`   状态: ${statusLabel}\n`);
+          console.log(`${badge}    状态: ${statusLabel}\n`);
           break;
         }
       }
     };
 
-    /** 多步骤 Plan 门控：rl.question 询问 y/n；Ctrl+C 时直接 resolve(false) 取消 */
-    const confirmPlan = (_plan: string): Promise<boolean> => {
-      return new Promise((resolve) => {
-        let settled = false;
-        const finish = (val: boolean) => {
-          if (settled) return;
-          settled = true;
-          rl.removeListener("SIGINT", onSigint);
-          resolve(val);
-        };
-        const onSigint = () => {
-          // Ctrl+C 在 Plan 确认期间 → 视为取消，不要卡住
-          console.log("\n  ⏹️  已取消该计划（Ctrl+C）");
-          finish(false);
-        };
-        rl.on("SIGINT", onSigint);
-        rl.question(`\n  ⏸️  上述 Plan 为多步骤，是否执行? (y/n) `, (answer) => {
-          finish(answer.trim().toLowerCase().startsWith("y"));
+    /**
+     * 超长任务兜底：前台跑超 30min 仍未完成时，注册影子任务转到后台继续，
+     * 释放前台输入。仅此一条转后台途径——新输入不再自动挤转（前台优先观察）。
+     * 幂等：已转后台则直接返回。
+     */
+    const bumpToBackground = (reason: string): void => {
+      if (taskWentBackground) return;
+      taskWentBackground = true;
+      // 释放前台输入拦截，让用户可继续输入命令（与 /bgstart 行为一致）
+      mainAgentRunning = false;
+      // 先抓住前台 AbortController 引用（下方置 null 后仍需用它联动 /kill）
+      const frontController = currentAbortController;
+      currentAbortController = null; // 释放中断控制权（任务继续，无法再 Ctrl+C 中断）
+      endThinkingStream();
+
+      // 在 BackgroundManager 注册"影子任务"：前台 run 仍在 await，
+      // 但 /status 可见、/kill 可取消（联动前台 AbortController）。
+      // run 结束时由下方 try/catch 标记 COMPLETED/CRASHED。
+      try {
+        const sess = sessionManager.current();
+        const mgr = getBackgroundManager();
+        const handles = mgr.createTask({
+          sessionId: sess ? sess.id : "前台",
+          title: sess && sess.title ? sess.title : input.slice(0, 60),
+          task: input,
         });
-      });
+        // /kill 影子任务会 abort 它自己的 controller；这里把"前台 controller"
+        // 与"影子任务"双向联动：前台被中断 → 影子取消；影子被 /kill → 前台中断
+        if (frontController) {
+          if (frontController.signal.aborted) {
+            try { mgr.cancel(handles.taskId); } catch {}
+          } else {
+            frontController.signal.addEventListener(
+              "abort",
+              () => { try { mgr.cancel(handles.taskId); } catch {} },
+              { once: true }
+            );
+            handles.signal.addEventListener(
+              "abort",
+              () => { try { frontController.abort(new Error("Task cancelled by user (/kill)")); } catch {} },
+              { once: true }
+            );
+          }
+        }
+        bgHandlesRef.current = handles;
+        // 立即标记开始（已在跑）
+        handles.markStart();
+      } catch {
+        bgHandlesRef.current = null; // 注册失败不影响伪后台视觉
+      }
+
+      const tid = bgHandlesRef.current ? bgHandlesRef.current.taskId.slice(0, 8) : "?";
+      console.log(
+        `\n${" [BG]"} ⏏️  任务已转入后台（${reason}）继续运行。`
+      );
+      console.log(
+        `${" [BG]"}    任务完成时会自动打印结果。用 /status 查看进度（id: ${tid}），/kill ${tid} 取消。\n`
+      );
+      refreshPrompt();
+      rl.prompt();
     };
 
+    /** 多步骤 Plan 门控：上下键选择执行/取消；Ctrl+C 视为取消 */
+    const confirmPlan = async (plan: string): Promise<boolean> => {
+      if (plan && plan.trim()) {
+        console.log(`\n${bgBadge()} 📋 待确认的委派/计划：`);
+        console.log(indent(plan, bgBadge() + "      "));
+      }
+      const picked = await selectPrompt(
+        `${bgBadge()} ⏸️  是否执行?`,
+        [
+          { label: "执行", desc: "Enter" },
+          { label: "取消", desc: "Ctrl+C" },
+        ],
+        rl,
+        { initialIdx: 0, cancelIdx: 1 },
+      );
+      if (picked === 1) console.log(`${bgBadge()} ⏹️  已取消该计划`);
+      return picked === 0;
+    };
+
+    let runResult: Awaited<ReturnType<SessionManager["run"]>> | null = null;
     try {
       currentAbortController = new AbortController();
-      await sessionManager.run(input, {
+      runResult = await sessionManager.run(input, {
         onEvent,
         confirmPlan,
         signal: currentAbortController.signal,
+        // 兜底：单任务跑超 30min 仍自动转后台，避免无限占前台。
+        // 正常情况任务在前台跑到完成，用户全程观察；并行需求用 /bgstart。
+        longTaskThresholdMs: 30 * 60 * 1000,
+        onLongTask: () => bumpToBackground("超时兜底"),
       });
+      // 转后台的任务：run 正常完成 → 标记影子任务 COMPLETED
+      const bgOk = bgHandlesRef.current;
+      if (bgOk) {
+        const snap = getBackgroundManager().getStatus(bgOk.taskId);
+        // 仅在仍处于运行态时标记完成（已被 /kill 取消则不覆盖）
+        if (snap && (snap.status === "RUNNING" || snap.status === "PENDING" || snap.status === "STUCK")) {
+          try { bgOk.markComplete(runResult); } catch {}
+        }
+      }
     } catch (error: any) {
+      // 转后台的任务：run 抛错 → 标记影子任务 CRASHED（已被 /kill 取消则不覆盖）
+      const bgErr = bgHandlesRef.current;
+      if (bgErr) {
+        const snap = getBackgroundManager().getStatus(bgErr.taskId);
+        if (snap && (snap.status === "RUNNING" || snap.status === "PENDING" || snap.status === "STUCK")) {
+          const eObj = error instanceof Error ? error : new Error(String(error));
+          try { bgErr.markCrash(eObj); } catch {}
+        }
+      }
       // 用户 Ctrl+C 中断不算错误，静默处理
       if (error?.name === "AbortError" || /\b(abort|中断|Ctrl\+C)\b/i.test(error?.message || "")) {
         console.log("  ⏹️  任务已中断。");
@@ -1213,8 +1588,12 @@ export async function startCLI(): Promise<void> {
         }
       }
     } finally {
+      // 兜底：确保 spinner / 思考缓冲清理（任务转后台后 onEvent 仍会自行管理，此处无害）
+      spinner.stop();
+      thinkingBuf.reset();
       currentAbortController = null;
-      mainAgentRunning = false;
+      // 已转后台的任务不在此处重置 mainAgentRunning（bumpToBackground 已设为 false）
+      if (!taskWentBackground) mainAgentRunning = false;
     }
 
     refreshPrompt();
@@ -1385,12 +1764,16 @@ async function runOneShot(task: string): Promise<void> {
     confirmFn: async () => true, // 非交互模式下默认允许副作用工具；可加 --dry 开关禁用
   });
   let titlePrinted = false;
+  const oneShotBuf = new ThinkingBuffer((t) => process.stdout.write(t));
   const final = await mgr.run(task, {
     onEvent: (ev: AgentEvent) => {
       switch (ev.type) {
-        case "thinking": process.stdout.write(ev.delta); break;
-        case "thought":  process.stdout.write("\n\n"); break;
+        case "thinking": oneShotBuf.push(ev.delta); break;
+        case "thought":
+          oneShotBuf.flushNow();
+          process.stdout.write("\n\n"); break;
         case "toolStart":
+          oneShotBuf.flushNow();
           if (!titlePrinted) { process.stdout.write("\n"); titlePrinted = true; }
           process.stdout.write(`🔧 ${ev.action.toolName}... `); break;
         case "toolEnd":

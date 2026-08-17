@@ -19,6 +19,7 @@ import {
   createCipherExtTools,
   createMiscCtfTools,
   createCryptoExtTools,
+  createRceTools,
 } from "./index";
 
 /**
@@ -46,5 +47,6 @@ export function createToolRegistry(): ToolRegistry {
   for (const t of createCipherExtTools().getAll()) toolRegistry.register(t);
   for (const t of createMiscCtfTools().getAll()) toolRegistry.register(t);
   for (const t of createCryptoExtTools().getAll()) toolRegistry.register(t);
+  for (const t of createRceTools().getAll()) toolRegistry.register(t);
   return toolRegistry;
 }

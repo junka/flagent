@@ -17,13 +17,13 @@ const ok = (name, cond) => {
 (async () => {
   console.log("\n=== 阶段9：导出完整性 ===");
 
-  // ① 包入口导出所有公共 API
+  // ① 包入口导出所有公共 API（迁移到原生 tool_use 后，文本协议解析器已移除；
+  //    SpawnAgentRequest 为类型导出，运行时不存在，不纳入运行时导出检查）
   const expected = [
     "ContextManager", "ToolRegistry", "createDefaultTools", "createWebTools",
     "createPwnTools", "createReverseTools", "createCryptoTools", "createMiscTools",
     "createToolRegistry",
     "SubAgent", "Scheduler", "MainAgent", "ToolExecutor",
-    "parseReactResponse", "parseToolCallLine", "parseMainReactResponse",
     "createAgentSystem",
     "PermissionManager", "model",
   ];

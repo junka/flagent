@@ -1,4 +1,4 @@
-// 阶段6 单元测试：parseMainReactResponse / ToolExecutor 并发限制器 / PermissionManager 双检锁
+// 阶段6 单元测试：ToolExecutor 并发限制器 / PermissionManager 双检锁
 // 无需网络与 LLM（全部 mock）。运行：node tests/stage6.test.js
 const { z } = require("zod");
 const { ToolRegistry } = require("../dist/tools");
@@ -6,9 +6,6 @@ const { ToolExecutor } = require("../dist/agents/tool-executor");
 const {
   PermissionManager,
 } = require("../dist/permissions/permission-manager");
-const {
-  parseMainReactResponse,
-} = require("../dist/agents/react-parser");
 
 let pass = 0;
 let fail = 0;
@@ -18,66 +15,6 @@ const ok = (name, cond) => {
 };
 
 (async () => {
-  // ============ parseMainReactResponse ============
-  console.log("\n=== parseMainReactResponse ===");
-
-  let r = parseMainReactResponse(
-    `THOUGHT: 并发采集两个目标
-ACTIONS:
-  - http_request({"url":"http://a.com"})
-  - port_scan({"host":"a.com"})`
-  );
-  ok("多 ACTIONS 解析数量", r.actions.length === 2);
-  ok("第一个工具名", r.actions[0].toolName === "http_request");
-  ok("第一个工具参数", r.actions[0].toolArgs.url === "http://a.com");
-  ok("第二个工具名", r.actions[1].toolName === "port_scan");
-  ok("THOUGHT 解析", r.thought === "并发采集两个目标");
-  ok("无 DELEGATE", r.delegates.length === 0);
-  ok("无 FINAL_ANSWER", r.finalAnswer === "");
-
-  r = parseMainReactResponse(
-    `THOUGHT: 分派给两个专家
-DELEGATE: web, pwn`
-  );
-  ok("多 DELEGATE 解析", r.delegates.length === 2 && r.delegates[0] === "web" && r.delegates[1] === "pwn");
-
-  r = parseMainReactResponse(
-    `THOUGHT: 边采集边委派
-ACTIONS:
-  - http_request({"url":"http://x.com"})
-DELEGATE: crypto`
-  );
-  ok("混合 ACTIONS+DELEGATE", r.actions.length === 1 && r.delegates.length === 1 && r.delegates[0] === "crypto");
-
-  r = parseMainReactResponse(
-    `ACTIONS:
-  - http_request({
-      "url": "http://x.com",
-      "timeout": 5000
-    })`
-  );
-  ok("多行 JSON 参数解析", r.actions.length === 1 && r.actions[0].toolArgs.url === "http://x.com" && r.actions[0].toolArgs.timeout === 5000);
-
-  r = parseMainReactResponse(
-    `THOUGHT: 完成
-FINAL_ANSWER: 最终答案`
-  );
-  ok("FINAL_ANSWER 解析", r.finalAnswer === "最终答案");
-  ok("FINAL_ANSWER 时无 actions", r.actions.length === 0);
-
-  r = parseMainReactResponse(
-    `ACTIONS:
-  http_request({"url":"http://a.com"})
-  port_scan({"host":"a.com"})`
-  );
-  ok("无标记裸工具调用", r.actions.length === 2);
-
-  r = parseMainReactResponse("random text no keys");
-  ok("无键文本全空", r.actions.length === 0 && r.delegates.length === 0 && r.finalAnswer === "");
-
-  r = parseMainReactResponse("DELEGATE：web，pwn");
-  ok("全角冒号+全角逗号 DELEGATE", r.delegates.length === 2);
-
   // ============ ToolExecutor 并发限制器 ============
   console.log("\n=== ToolExecutor 并发限制器 ===");
 

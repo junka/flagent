@@ -1,30 +1,41 @@
-// 验证事件机制与 Plan 门控
-// mock 策略：替换 dist/llm/client 导出的 model（export let → 可写 exports.model）
+// 验证事件机制与 Plan 门控（tool_use 协议版）
+// mock 策略：替换 dist/llm/client 导出的 model（CommonJS exports.model 可写）
 // main-agent.js 持有 require("../llm/client") 同一引用，patch 即生效
-// doGenerate 动态读取 mockTextFn()，支持多场景切换
+// doStream 动态读取 mockStreamFn()，按场景输出 text-delta / tool-call / finish 流片段
+//
+// 迁移到原生 tool_use 协议后，旧文本协议（THOUGHT/ACTIONS/DELEGATE/FINAL_ANSWER 标记）
+// 已移除；本文件验证新的 streamText + tools + stopWhen 事件流。
 
 const client = require("../dist/llm/client");
-let mockTextFn = () => "";
+
+// 每次调用返回一个流片段数组（LanguageModelV2StreamPart）
+let mockStreamFn = () => [];
+
+function makeStream(parts) {
+  return new ReadableStream({
+    start(controller) {
+      for (const p of parts) controller.enqueue(p);
+      controller.close();
+    },
+  });
+}
+
 client.model = {
-  specificationVersion: "v2",
+  specificationVersion: "v4",
   provider: "mock",
   modelId: "mock-model",
-  doGenerate: async () => ({
-    content: [{ type: "text", text: mockTextFn() }],
-    usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-    finishReason: "stop",
-    warnings: [],
-    response: { timestamp: new Date(), modelId: "mock-model", headers: {} },
+  doStream: async () => ({
+    stream: makeStream(mockStreamFn()),
   }),
 };
 
 const { MainAgent } = require("../dist/agents/main-agent");
 const { ToolExecutor } = require("../dist/agents/tool-executor");
-const { ToolRegistry } = require("../dist/agents/../tools/registry");
-const { ContextManager } = require("../dist/agents/../context/context-manager");
+const { ToolRegistry } = require("../dist/tools/registry");
+const { ContextManager } = require("../dist/context/context-manager");
 const { Scheduler } = require("../dist/agents/scheduler");
-const { PermissionManager } = require("../dist/agents/../permissions/permission-manager");
-const { Session } = require("../dist/agents/../session/session");
+const { PermissionManager } = require("../dist/permissions/permission-manager");
+const { Session } = require("../dist/session/session");
 
 function buildRegistry() {
   const registry = new ToolRegistry();
@@ -59,143 +70,78 @@ const assert = (cond, msg) => {
   }
 };
 
+// 构造一段 tool_use 流：先吐一段思考文本，再调用 final_answer 工具交卷
+function streamThinkingThenFinalAnswer(thinking, answer) {
+  return [
+    { type: "stream-start", warnings: [] },
+    { type: "text-start", id: "t1" },
+    { type: "text-delta", id: "t1", delta: thinking },
+    { type: "text-end", id: "t1" },
+    { type: "tool-call", toolCallId: "call_1", toolName: "final_answer", input: JSON.stringify({ answer }) },
+    { type: "finish", finishReason: "tool-calls", usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+  ];
+}
+
+// 先调用 echo 工具（采集），下一步再 final_answer
+function streamEchoOnly() {
+  return [
+    { type: "stream-start", warnings: [] },
+    { type: "tool-call", toolCallId: "call_e", toolName: "echo", input: JSON.stringify({}) },
+    { type: "finish", finishReason: "tool-calls", usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+  ];
+}
+
 async function main() {
-  // 测试1：FINAL_ANSWER 事件流
-  console.log("\n=== 测试1: FINAL_ANSWER 事件流 ===");
+  // 测试1：final_answer 事件流（thinking + finalAnswer + complete）
+  console.log("\n=== 测试1: final_answer 事件流 ===");
   {
     const session = buildSession();
     const events = [];
-    mockTextFn = () => "THOUGHT: 简单算术\nFINAL_ANSWER: 2";
+    mockStreamFn = () => streamThinkingThenFinalAnswer("正在计算 1+1", "2");
     const result = await session.run("1+1=?", {
       onEvent: (e) => events.push(e),
     });
     const types = events.map((e) => e.type);
-    assert(
-      types.includes("thought") && types.includes("finalAnswer"),
-      "应触发 thought + finalAnswer 事件"
-    );
+    assert(types.includes("thinking"), "应触发 thinking 事件（textStream delta）");
+    assert(types.includes("finalAnswer"), "应触发 finalAnswer 事件");
     assert(types.includes("complete"), "应触发 complete 事件");
-    assert(result.success === true, "返回 success=true");
+    assert(result.success === true, "返回 success=true（final_answer toolCall 命中）");
     assert(
       result.finalAnswer === "2",
       "finalAnswer=2 (实际: " + JSON.stringify(result.finalAnswer) + ")"
     );
   }
 
-  // 测试2：多步骤 Plan 门控 - 用户确认（验证 toolExecutor 事件桥接）
-  console.log("\n=== 测试2: 多步骤 Plan 门控（确认）===");
-  {
-    const session = buildSession();
-    const events = [];
-    let confirmCalled = false;
-    let call = 0;
-    mockTextFn = () => {
-      call++;
-      if (call === 1)
-        return "PLAN: 1. 侦察目标\n2. 分析结果\nTHOUGHT: 需多步\nACTIONS:\n  - echo({})\n  - echo({})";
-      return "THOUGHT: 完成\nFINAL_ANSWER: done";
-    };
-    const result = await session.run("复杂任务", {
-      onEvent: (e) => events.push(e),
-      confirmPlan: async () => {
-        confirmCalled = true;
-        return true;
-      },
-    });
-    const types = events.map((e) => e.type);
-    assert(types.includes("plan"), "应触发 plan 事件");
-    assert(
-      events.find((e) => e.type === "plan").isMultiStep === true,
-      "isMultiStep=true（含2编号步骤）"
-    );
-    assert(confirmCalled, "confirmPlan 应被调用");
-    assert(types.includes("planConfirmed"), "应触发 planConfirmed 事件");
-    assert(types.includes("actionStart"), "应触发 actionStart 事件");
-    assert(types.includes("toolEnd"), "应触发 toolEnd 事件（ToolExecutor 桥接）");
-    assert(
-      events.filter((t) => t.type === "toolEnd").length === 2,
-      "2 个 toolEnd（2 个 echo）"
-    );
-    assert(result.finalAnswer === "done", "确认后继续执行到 done");
-  }
-
-  // 测试3：多步骤 Plan 门控 - 用户拒绝
-  console.log("\n=== 测试3: 多步骤 Plan 门控（拒绝）===");
-  {
-    const session = buildSession();
-    const events = [];
-    mockTextFn = () =>
-      "PLAN: 1. 侦察\n2. 利用\n3. 清理\nTHOUGHT: 复杂\nACTIONS:\n  - echo({})";
-    const result = await session.run("渗透任务", {
-      onEvent: (e) => events.push(e),
-      confirmPlan: async () => false,
-    });
-    const types = events.map((e) => e.type);
-    assert(
-      events.find((e) => e.type === "plan").isMultiStep === true,
-      "3 编号步骤 isMultiStep=true"
-    );
-    assert(
-      types.includes("planConfirmed") &&
-        events.find((e) => e.type === "planConfirmed").confirmed === false,
-      "planConfirmed=false"
-    );
-    assert(!types.includes("actionStart"), "拒绝后不应执行 actionStart");
-    assert(result.success === true, "拒绝返回 success=true（结束）");
-    assert(result.finalAnswer.includes("取消"), "finalAnswer 含'取消'");
-  }
-
-  // 测试4：单步骤 Plan（1编号 + 1动作）不门控
-  console.log("\n=== 测试4: 单步骤 Plan 不门控 ===");
-  {
-    const session = buildSession();
-    const events = [];
-    let confirmCalled = false;
-    let call = 0;
-    mockTextFn = () => {
-      call++;
-      if (call === 1)
-        return "PLAN: 1. 采集信息\nTHOUGHT: 单步\nACTIONS:\n  - echo({})";
-      return "THOUGHT: ok\nFINAL_ANSWER: ok";
-    };
-    await session.run("简单采集", {
-      onEvent: (e) => events.push(e),
-      confirmPlan: async () => {
-        confirmCalled = true;
-        return true;
-      },
-    });
-    const planEvent = events.find((e) => e.type === "plan");
-    assert(
-      planEvent && planEvent.isMultiStep === false,
-      "1编号+1动作 isMultiStep=false"
-    );
-    assert(!confirmCalled, "单步骤不应调用 confirmPlan");
-  }
-
-  // 测试5：无 Plan 但 2 个并发动作（无门控，直接执行）
-  console.log("\n=== 测试5: 无 Plan 2 并发动作（无门控，直接执行）===");
+  // 测试2：先调用 echo 工具采集，再 final_answer 交卷（验证 tool 循环）
+  console.log("\n=== 测试2: 工具调用循环（echo → final_answer）===");
   {
     const session = buildSession();
     const events = [];
     let call = 0;
-    mockTextFn = () => {
+    mockStreamFn = () => {
       call++;
-      if (call === 1) return "THOUGHT: 并发采集\nACTIONS:\n  - echo({})\n  - echo({})";
-      return "THOUGHT: ok\nFINAL_ANSWER: done";
+      if (call === 1) {
+        // 第一步：调用 echo
+        return streamEchoOnly();
+      }
+      // 第二步：交卷
+      return streamThinkingThenFinalAnswer("已采集", "done");
     };
-    const result = await session.run("并发采集", {
+    const result = await session.run("采集并回答", {
       onEvent: (e) => events.push(e),
     });
     const types = events.map((e) => e.type);
-    assert(!types.includes("plan"), "无 PLAN 不触发 plan 事件");
-    assert(types.includes("actionStart"), "触发 actionStart");
-    assert(types.includes("toolEnd"), "触发 toolEnd");
-    assert(result.finalAnswer === "done", "完成");
+    assert(call === 2, "应执行 2 轮模型调用（echo + final_answer）");
+    assert(result.success === true, "返回 success=true");
+    assert(result.finalAnswer === "done", "finalAnswer=done");
+    assert(
+      events.filter((e) => e.type === "toolEnd").length >= 1,
+      "应触发 toolEnd 事件（echo 执行）"
+    );
   }
 
-  // 测试6：ToolExecutor 事件（直接测）
-  console.log("\n=== 测试6: ToolExecutor toolStart/toolEnd 事件 ===");
+  // 测试3：ToolExecutor toolStart/toolEnd 事件（直接测，与主循环解耦）
+  console.log("\n=== 测试3: ToolExecutor toolStart/toolEnd 事件 ===");
   {
     const registry = buildRegistry();
     const te = new ToolExecutor(
@@ -210,42 +156,6 @@ async function main() {
     ]);
     assert(tevents.filter((t) => t === "toolStart").length === 2, "2 个 toolStart");
     assert(tevents.filter((t) => t === "toolEnd").length === 2, "2 个 toolEnd");
-  }
-
-  // 测试7：isMultiStepPlan 纯逻辑（通过 Session.getMainAgent 访问 private）
-  console.log("\n=== 测试7: isMultiStepPlan 纯逻辑 ===");
-  {
-    const session = buildSession();
-    const agent = session.getMainAgent();
-    const f = (plan, a, d) => agent.isMultiStepPlan(plan, a, d);
-    assert(f("1. a\n2. b", 0, 0) === true, "2 编号步骤 → true");
-    assert(f("1. a\n2. b\n3. c", 0, 0) === true, "3 编号步骤 → true");
-    assert(f("1. a", 0, 0) === false, "1 编号步骤 → false");
-    assert(f("无编号计划", 0, 0) === false, "无编号+0动作 → false");
-    assert(f("无编号计划", 2, 0) === true, "无编号+2动作 → true");
-    assert(f("无编号计划", 1, 1) === true, "无编号+1动作+1委派 → true");
-    assert(f("1) a\n2) b", 0, 0) === true, "圆括号编号 2 步骤 → true");
-    assert(f("1、a\n2、b", 0, 0) === true, "顿号编号 2 步骤 → true");
-  }
-
-  // 测试8：多行 writeup FINAL_ANSWER 解析完整性
-  console.log("\n=== 测试8: 多行 writeup FINAL_ANSWER 解析 ===");
-  {
-    const { parseMainReactResponse } = require("../dist/agents/react-parser");
-    const multiLine =
-      "THOUGHT: 已拿到 flag\n" +
-      "FINAL_ANSWER: Flag: flag{ctfhub{abc123}}\n" +
-      "Writeup:\n" +
-      "1. 访问 http://target/phpinfo.php，观察首页提示\n" +
-      "2. 在 phpinfo 输出的 Environment 段查找 FLAG 字段\n" +
-      "3. 复制 flag 值提交";
-    const parsed = parseMainReactResponse(multiLine);
-    assert(parsed.finalAnswer.includes("flag{ctfhub{abc123}}"), "finalAnswer 含 flag");
-    assert(parsed.finalAnswer.includes("Writeup:"), "finalAnswer 含 Writeup 段");
-    assert(parsed.finalAnswer.includes("1. 访问"), "finalAnswer 含步骤1");
-    assert(parsed.finalAnswer.includes("3. 复制 flag"), "finalAnswer 含步骤3");
-    assert(parsed.actions.length === 0, "无 ACTIONS");
-    assert(!parsed.plan, "无 PLAN");
   }
 
   console.log(`\n=== 结果: ${pass} passed, ${fail} failed ===`);

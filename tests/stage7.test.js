@@ -1,12 +1,9 @@
-// 阶段7 单元测试：parseMainReactResponse(SPAWN_AGENT) / Scheduler.registerDynamicAgent
+// 阶段7 单元测试：Scheduler.registerDynamicAgent / unregisterDynamicAgent / dispatchConcurrent
 // 无需网络与 LLM（全部 mock）。运行：node tests/stage7.test.js
 const { z } = require("zod");
 const { ToolRegistry } = require("../dist/tools");
 const { ToolExecutor } = require("../dist/agents/tool-executor");
 const { Scheduler } = require("../dist/agents/scheduler");
-const {
-  parseMainReactResponse,
-} = require("../dist/agents/react-parser");
 
 let pass = 0;
 let fail = 0;
@@ -31,67 +28,6 @@ function makeRegistry() {
 }
 
 (async () => {
-  // ============ parseMainReactResponse: SPAWN_AGENT ============
-  console.log("\n=== parseMainReactResponse: SPAWN_AGENT ===");
-
-  let r = parseMainReactResponse(
-    `THOUGHT: 此题不落进预设类别，自定义一个通用 agent
-SPAWN_AGENT: {"id":"gen-foo","name":"Foo专家","role":"Foo分析","systemPrompt":"你是Foo专家","toolNames":["tool_a","tool_b"]}
-DELEGATE: gen-foo`
-  );
-  ok("SPAWN_AGENT 解析数量", r.spawnAgents.length === 1);
-  ok("SPAWN_AGENT id", r.spawnAgents[0].id === "gen-foo");
-  ok("SPAWN_AGENT name", r.spawnAgents[0].name === "Foo专家");
-  ok("SPAWN_AGENT role", r.spawnAgents[0].role === "Foo分析");
-  ok("SPAWN_AGENT systemPrompt", r.spawnAgents[0].systemPrompt === "你是Foo专家");
-  ok("SPAWN_AGENT toolNames", r.spawnAgents[0].toolNames.length === 2 && r.spawnAgents[0].toolNames[0] === "tool_a");
-  ok("SPAWN_AGENT + DELEGATE 共存", r.delegates.length === 1 && r.delegates[0] === "gen-foo");
-
-  // 多行 JSON（换行出现在 token 之间）
-  r = parseMainReactResponse(
-    `SPAWN_AGENT: {
-  "id": "gen-bar",
-  "name": "Bar",
-  "role": "Bar分析",
-  "systemPrompt": "你是Bar",
-  "toolNames": ["tool_c"],
-  "maxSteps": 5
-}`
-  );
-  ok("多行 JSON SPAWN_AGENT", r.spawnAgents.length === 1 && r.spawnAgents[0].id === "gen-bar");
-  ok("多行 JSON maxSteps", r.spawnAgents[0].maxSteps === 5);
-
-  // 畸形 JSON 容错（不阻断其余解析）
-  r = parseMainReactResponse(
-    `THOUGHT: ok
-SPAWN_AGENT: {bad json
-ACTIONS:
-  - tool_a({"x":"1"})`
-  );
-  ok("畸形 JSON 忽略 spawnAgents", r.spawnAgents.length === 0);
-  ok("畸形 JSON 不阻断 ACTIONS", r.actions.length === 1);
-
-  // 缺少 id / toolNames 忽略
-  r = parseMainReactResponse(
-    `SPAWN_AGENT: {"id":"gen-x","name":"X"}`
-  );
-  ok("缺 toolNames 忽略", r.spawnAgents.length === 0);
-  r = parseMainReactResponse(
-    `SPAWN_AGENT: {"name":"X","toolNames":["tool_a"]}`
-  );
-  ok("缺 id 忽略", r.spawnAgents.length === 0);
-
-  // 多个 SPAWN_AGENT
-  r = parseMainReactResponse(
-    `SPAWN_AGENT: {"id":"gen-1","name":"1","role":"r1","systemPrompt":"s1","toolNames":["tool_a"]}
-SPAWN_AGENT: {"id":"gen-2","name":"2","role":"r2","systemPrompt":"s2","toolNames":["tool_b"]}`
-  );
-  ok("多个 SPAWN_AGENT", r.spawnAgents.length === 2 && r.spawnAgents[0].id === "gen-1" && r.spawnAgents[1].id === "gen-2");
-
-  // 默认 spawnAgents 为空数组
-  r = parseMainReactResponse("THOUGHT: 仅思考");
-  ok("无 SPAWN_AGENT 时空数组", Array.isArray(r.spawnAgents) && r.spawnAgents.length === 0);
-
   // ============ Scheduler.registerDynamicAgent ============
   console.log("\n=== Scheduler.registerDynamicAgent ===");
 
